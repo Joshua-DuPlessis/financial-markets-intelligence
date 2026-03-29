@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS sens_financial_announcements (
     announcement_date TEXT,
     pdf_url TEXT,
     local_pdf_path TEXT,
+    first_seen_run_id TEXT,
+    first_seen_at TEXT,
     category TEXT NOT NULL DEFAULT 'other',
     classification_reason TEXT,
     classification_version TEXT,
@@ -85,6 +87,12 @@ ON sens_financial_announcements(analyst_relevant);
 
 CREATE INDEX IF NOT EXISTS idx_announcements_classified_at
 ON sens_financial_announcements(classified_at);
+
+CREATE INDEX IF NOT EXISTS idx_announcements_first_seen_run_id
+ON sens_financial_announcements(first_seen_run_id);
+
+CREATE INDEX IF NOT EXISTS idx_announcements_first_seen_at
+ON sens_financial_announcements(first_seen_at);
 
 CREATE INDEX IF NOT EXISTS idx_release_signals_sens_id
 ON release_signals(sens_id);

@@ -41,6 +41,11 @@ DOWNLOAD_BACKOFF_SECONDS = _float_env(
     default=1.0,
     minimum=0.0,
 )
+DOWNLOAD_MIN_INTERVAL_SECONDS = _float_env(
+    "SENS_DOWNLOAD_MIN_INTERVAL_SECONDS",
+    default=1.0,
+    minimum=0.0,
+)
 SCRAPE_MAX_ATTEMPTS = _int_env("SENS_SCRAPE_MAX_ATTEMPTS", default=2, minimum=1)
 SCRAPE_RETRY_BACKOFF_SECONDS = _float_env(
     "SENS_SCRAPE_RETRY_BACKOFF_SECONDS",

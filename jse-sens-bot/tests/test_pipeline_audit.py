@@ -299,6 +299,202 @@ class PipelineAuditTests(unittest.TestCase):
                 self.assertEqual(len(classify_events), 1)
                 self.assertIn("disambiguation_attempted", classify_events[0]["metadata_json"])
 
+    def test_run_pipeline_dry_run_no_download_skips_disambiguation_download(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sens_test.db"
+
+            with connect_db(db_path=db_path) as conn:
+                initialize_db(conn, schema_path=SCHEMA_PATH)
+
+            scrape_result = fetch_sens.ScrapeResult(
+                announcements=[
+                    fetch_sens.Announcement(
+                        sens_id="SENS902",
+                        company="ABC Limited",
+                        title="Quarterly Statement Update",
+                        announcement_date="2026-03-30T10:00:00+00:00",
+                        pdf_url="https://senspdf.jse.co.za/documents/SENS_902.pdf",
+                        issuer_context="ABC Limited | Equity Issuer (JSE)",
+                        issuer_tags=("equity",),
+                    )
+                ],
+                raw_candidate_count=1,
+                reject_counts={
+                    "not_pdf_like_link": 0,
+                    "disallowed_host": 0,
+                    "not_probable_announcement_pdf": 0,
+                    "missing_sens_id": 0,
+                    "duplicate_sens_id": 0,
+                    "issuer_unknown": 0,
+                    "issuer_non_equity": 0,
+                },
+            )
+
+            def _connect_tmp_db():
+                return connect_db(db_path=db_path)
+
+            with mock.patch.object(
+                fetch_sens, "connect_db", side_effect=_connect_tmp_db
+            ), mock.patch.object(
+                fetch_sens, "should_skip_collection_now", return_value=False
+            ), mock.patch.object(
+                fetch_sens,
+                "scrape_announcements",
+                new=mock.AsyncMock(return_value=scrape_result),
+            ), mock.patch.object(fetch_sens, "download_pdf") as mocked_download:
+                asyncio.run(
+                    fetch_sens.run_pipeline(
+                        dry_run=True,
+                        skip_download=False,
+                        dry_run_no_download=True,
+                        include_all=False,
+                        run_id="release4-dry-no-download-001",
+                    )
+                )
+                mocked_download.assert_not_called()
+
+    def test_run_pipeline_logs_quarantine_events(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sens_test.db"
+
+            with connect_db(db_path=db_path) as conn:
+                initialize_db(conn, schema_path=SCHEMA_PATH)
+
+            scrape_result = fetch_sens.ScrapeResult(
+                announcements=[],
+                raw_candidate_count=2,
+                reject_counts={
+                    "not_pdf_like_link": 0,
+                    "disallowed_host": 0,
+                    "not_probable_announcement_pdf": 0,
+                    "missing_sens_id": 0,
+                    "duplicate_sens_id": 0,
+                    "issuer_unknown": 1,
+                    "issuer_non_equity": 0,
+                },
+                quarantine_candidates=[
+                    {
+                        "reason": "issuer_unknown",
+                        "raw_value": "/documents/SENS_777777.pdf",
+                        "title": "Issuer missing context trading statement",
+                        "context": "",
+                        "pdf_url": "https://senspdf.jse.co.za/documents/SENS_777777.pdf",
+                        "sens_id": "777777",
+                    }
+                ],
+            )
+
+            def _connect_tmp_db():
+                return connect_db(db_path=db_path)
+
+            with mock.patch.object(
+                fetch_sens, "connect_db", side_effect=_connect_tmp_db
+            ), mock.patch.object(
+                fetch_sens, "should_skip_collection_now", return_value=False
+            ), mock.patch.object(
+                fetch_sens,
+                "scrape_announcements",
+                new=mock.AsyncMock(return_value=scrape_result),
+            ):
+                run_id = asyncio.run(
+                    fetch_sens.run_pipeline(
+                        dry_run=True,
+                        include_all=True,
+                        run_id="release4-quarantine-001",
+                    )
+                )
+
+            with connect_db(db_path=db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT stage, event_type, message, metadata_json
+                    FROM ingest_events
+                    WHERE run_id = ? AND stage = 'quarantine'
+                    """,
+                    (run_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row["event_type"], "warning")
+                self.assertIn("issuer_unknown", row["metadata_json"])
+
+    def test_run_pipeline_persists_release_signal_from_title(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sens_test.db"
+
+            with connect_db(db_path=db_path) as conn:
+                initialize_db(conn, schema_path=SCHEMA_PATH)
+
+            scrape_result = fetch_sens.ScrapeResult(
+                announcements=[
+                    fetch_sens.Announcement(
+                        sens_id="SENS903",
+                        company="ABC Limited",
+                        title=(
+                            "Annual report will be released on 30 March 2026 at 09:00 "
+                            "| ABC Limited"
+                        ),
+                        announcement_date="2026-03-30T10:00:00+00:00",
+                        pdf_url="https://senspdf.jse.co.za/documents/SENS_903.pdf",
+                        issuer_context="ABC Limited | Equity Issuer (JSE)",
+                        issuer_tags=("equity",),
+                    )
+                ],
+                raw_candidate_count=1,
+                reject_counts={
+                    "not_pdf_like_link": 0,
+                    "disallowed_host": 0,
+                    "not_probable_announcement_pdf": 0,
+                    "missing_sens_id": 0,
+                    "duplicate_sens_id": 0,
+                    "issuer_unknown": 0,
+                    "issuer_non_equity": 0,
+                },
+            )
+
+            def _connect_tmp_db():
+                return connect_db(db_path=db_path)
+
+            with mock.patch.object(
+                fetch_sens, "connect_db", side_effect=_connect_tmp_db
+            ), mock.patch.object(
+                fetch_sens, "should_skip_collection_now", return_value=False
+            ), mock.patch.object(
+                fetch_sens,
+                "scrape_announcements",
+                new=mock.AsyncMock(return_value=scrape_result),
+            ):
+                run_id = asyncio.run(
+                    fetch_sens.run_pipeline(
+                        dry_run=False,
+                        skip_download=True,
+                        include_all=False,
+                        run_id="release4-signal-001",
+                    )
+                )
+
+            with connect_db(db_path=db_path) as conn:
+                signal_row = conn.execute(
+                    """
+                    SELECT signal_type, signal_datetime, source
+                    FROM release_signals
+                    WHERE sens_id = 'SENS903'
+                    """
+                ).fetchone()
+                self.assertIsNotNone(signal_row)
+                self.assertEqual(signal_row["signal_type"], "future_release_datetime")
+                self.assertEqual(signal_row["source"], "title")
+
+                announcement_row = conn.execute(
+                    """
+                    SELECT first_seen_run_id, first_seen_at
+                    FROM sens_financial_announcements
+                    WHERE sens_id = 'SENS903'
+                    """
+                ).fetchone()
+                self.assertIsNotNone(announcement_row)
+                self.assertEqual(announcement_row["first_seen_run_id"], run_id)
+                self.assertTrue(announcement_row["first_seen_at"])
+
 
 if __name__ == "__main__":
     unittest.main()

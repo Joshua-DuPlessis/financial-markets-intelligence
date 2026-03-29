@@ -6,15 +6,19 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from mvp_sens.configs.config import SCHEMA_PATH
+from mvp_sens.scripts import analyst_outputs
 from mvp_sens.scripts.analyst_outputs import (
     DISCLOSURE_EXPORT_FIELDS,
     RELEASE_SIGNAL_EXPORT_FIELDS,
+    advance_since_last_run_cursor,
     build_daily_delta_rows,
     build_intraday_snapshot_rows,
     build_release_signal_rows,
     build_since_last_run_rows,
+    export_since_last_run,
     write_export,
 )
 from mvp_sens.scripts.db_insert import (
@@ -75,6 +79,8 @@ class AnalystOutputsTests(unittest.TestCase):
                 "classification_reason": "kw_financial_results",
                 "classification_version": "test-v1",
                 "classified_at": completed_at,
+                "first_seen_run_id": run_id,
+                "first_seen_at": completed_at,
                 "analyst_relevant": 1,
                 "relevance_reason": "kw_financial_results",
             },
@@ -116,18 +122,90 @@ class AnalystOutputsTests(unittest.TestCase):
                     completed_at="2026-03-27T08:00:00+00:00",
                 )
 
-                rows, cursor_before, cursor_after = build_since_last_run_rows(
-                    conn,
-                    advance_cursor=True,
-                )
+                rows, cursor_before, cursor_after = build_since_last_run_rows(conn)
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0]["sens_id"], "SENS002")
                 self.assertEqual(cursor_before["run_id"], "run-001")
                 self.assertEqual(cursor_after["run_id"], "run-002")
 
+                advance_since_last_run_cursor(conn, cursor_after)
                 cursor_now = get_global_reporting_cursor(conn)
                 self.assertIsNotNone(cursor_now)
                 self.assertEqual(cursor_now["run_id"], "run-002")
+
+    def test_since_last_run_does_not_treat_reclassification_as_new(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sens_test.db"
+            with connect_db(db_path=db_path) as conn:
+                initialize_db(conn, schema_path=SCHEMA_PATH)
+                self._insert_success_run(conn, "run-401", "2026-03-27T08:00:00+00:00")
+                self._insert_success_run(conn, "run-402", "2026-03-27T09:00:00+00:00")
+                self._insert_relevant_announcement(
+                    conn,
+                    sens_id="SENS401",
+                    run_id="run-401",
+                    completed_at="2026-03-27T08:00:00+00:00",
+                )
+                # Later classify event should not change first-seen newness.
+                log_ingest_event(
+                    conn=conn,
+                    run_id="run-402",
+                    stage="classify",
+                    event_type="info",
+                    sens_id="SENS401",
+                    message="Classification decision",
+                    metadata={"category": "financial_results"},
+                )
+                set_global_reporting_cursor(
+                    conn,
+                    run_id="run-401",
+                    completed_at="2026-03-27T08:00:00+00:00",
+                )
+
+                rows, cursor_before, cursor_after = build_since_last_run_rows(conn)
+                self.assertEqual(len(rows), 0)
+                self.assertEqual(cursor_before["run_id"], "run-401")
+                self.assertEqual(cursor_after["run_id"], "run-402")
+
+    def test_cursor_not_advanced_when_export_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sens_test.db"
+            with connect_db(db_path=db_path) as conn:
+                initialize_db(conn, schema_path=SCHEMA_PATH)
+                self._insert_success_run(conn, "run-501", "2026-03-27T08:00:00+00:00")
+                self._insert_success_run(conn, "run-502", "2026-03-27T09:00:00+00:00")
+                self._insert_relevant_announcement(
+                    conn,
+                    sens_id="SENS501",
+                    run_id="run-502",
+                    completed_at="2026-03-27T09:00:00+00:00",
+                )
+                set_global_reporting_cursor(
+                    conn,
+                    run_id="run-501",
+                    completed_at="2026-03-27T08:00:00+00:00",
+                )
+
+                _rows, _cursor_before, cursor_after = build_since_last_run_rows(conn)
+                with mock.patch.object(
+                    analyst_outputs,
+                    "write_export",
+                    side_effect=OSError("disk write failed"),
+                ):
+                    with self.assertRaises(OSError):
+                        export_since_last_run(
+                            conn=conn,
+                            output_format="json",
+                            output_path=str(Path(tmpdir) / "fail.json"),
+                            advance_cursor=True,
+                        )
+                # Cursor should remain unchanged because advance is explicit post-write.
+                cursor_now = get_global_reporting_cursor(conn)
+                self.assertEqual(cursor_now["run_id"], "run-501")
+                # Manual advance can still occur after a successful write.
+                advance_since_last_run_cursor(conn, cursor_after)
+                cursor_now = get_global_reporting_cursor(conn)
+                self.assertEqual(cursor_now["run_id"], "run-502")
 
     def test_intraday_snapshot_uses_jse_window(self):
         with tempfile.TemporaryDirectory() as tmpdir:

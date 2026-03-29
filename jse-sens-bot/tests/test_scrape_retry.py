@@ -16,6 +16,8 @@ def _reject_counts() -> dict[str, int]:
         "not_probable_announcement_pdf": 0,
         "missing_sens_id": 0,
         "duplicate_sens_id": 0,
+        "issuer_unknown": 0,
+        "issuer_non_equity": 0,
     }
 
 
@@ -23,7 +25,7 @@ class ScrapeRetryTests(unittest.TestCase):
     def test_scrape_with_retry_recovers_after_empty_first_attempt(self):
         monday_utc = datetime(2026, 3, 30, 10, 0, 0, tzinfo=timezone.utc)
         results = [
-            (0, [], _reject_counts()),
+            (0, [], _reject_counts(), []),
             (
                 4,
                 [
@@ -36,6 +38,7 @@ class ScrapeRetryTests(unittest.TestCase):
                     )
                 ],
                 _reject_counts(),
+                [],
             ),
         ]
 

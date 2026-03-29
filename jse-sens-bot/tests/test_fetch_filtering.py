@@ -8,6 +8,7 @@ from mvp_sens.scripts.fetch_sens import (
     get_scrape_retry_delay_seconds,
     is_dom_change_suspected,
     parse_raw_candidates,
+    parse_raw_candidates_with_quarantine,
     should_retry_after_scrape,
 )
 
@@ -73,6 +74,24 @@ class FetchFilteringTests(unittest.TestCase):
 
         self.assertEqual(len(announcements), 0)
         self.assertEqual(reject_counts["issuer_non_equity"], 1)
+
+    def test_parse_raw_candidates_quarantines_unknown_issuer(self):
+        raw_candidates = [
+            (
+                "/documents/SENS_777777.pdf",
+                "Issuer missing context trading statement",
+                "",
+            )
+        ]
+        announcements, reject_counts, quarantine_candidates = (
+            parse_raw_candidates_with_quarantine(raw_candidates)
+        )
+
+        self.assertEqual(len(announcements), 0)
+        self.assertEqual(reject_counts["issuer_unknown"], 1)
+        self.assertEqual(len(quarantine_candidates), 1)
+        self.assertEqual(quarantine_candidates[0]["reason"], "issuer_unknown")
+        self.assertEqual(quarantine_candidates[0]["sens_id"], "777777")
 
     def test_parse_raw_candidates_accepts_mixed_issuer_labels_with_equity(self):
         raw_candidates = [
