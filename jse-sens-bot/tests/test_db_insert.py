@@ -141,6 +141,8 @@ class DbInsertTests(unittest.TestCase):
                 self.assertIn("classified_at", column_names)
                 self.assertIn("analyst_relevant", column_names)
                 self.assertIn("relevance_reason", column_names)
+                self.assertIn("first_seen_run_id", column_names)
+                self.assertIn("first_seen_at", column_names)
 
     def test_release_signal_insert_and_dedup(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -231,6 +233,8 @@ class DbInsertTests(unittest.TestCase):
                 self.assertIn("category", column_names)
                 self.assertIn("analyst_relevant", column_names)
                 self.assertIn("classification_reason", column_names)
+                self.assertIn("first_seen_run_id", column_names)
+                self.assertIn("first_seen_at", column_names)
 
 
 if __name__ == "__main__":

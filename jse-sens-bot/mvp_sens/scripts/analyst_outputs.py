@@ -58,8 +58,8 @@ RELEASE_SIGNAL_EXPORT_FIELDS = (
 
 FETCH_RELEVANT_DISCLOSURES_SQL = """
 SELECT
-    COALESCE(latest_classify.run_id, '') AS run_id,
-    COALESCE(latest_classify.run_completed_at, '') AS run_completed_at,
+    COALESCE(ann.first_seen_run_id, '') AS run_id,
+    COALESCE(first_run.completed_at, '') AS run_completed_at,
     ann.sens_id,
     ann.company,
     ann.title,
@@ -70,24 +70,12 @@ SELECT
     ann.classification_reason,
     ann.classification_version,
     ann.classified_at,
+    ann.first_seen_at,
     ann.pdf_url,
     ann.local_pdf_path,
     ann.created_at
 FROM sens_financial_announcements AS ann
-LEFT JOIN (
-    SELECT
-        ie.sens_id,
-        ie.run_id,
-        ir.completed_at AS run_completed_at
-    FROM ingest_events AS ie
-    LEFT JOIN ingest_runs AS ir ON ir.run_id = ie.run_id
-    INNER JOIN (
-        SELECT sens_id, MAX(id) AS max_id
-        FROM ingest_events
-        WHERE stage = 'classify' AND sens_id IS NOT NULL
-        GROUP BY sens_id
-    ) AS latest ON latest.max_id = ie.id
-) AS latest_classify ON latest_classify.sens_id = ann.sens_id
+LEFT JOIN ingest_runs AS first_run ON first_run.run_id = ann.first_seen_run_id
 WHERE ann.analyst_relevant = 1
 """
 
@@ -143,7 +131,13 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 
 def _observed_timestamp_utc(row: Mapping[str, Any]) -> datetime | None:
-    for key in ("run_completed_at", "classified_at", "announcement_date", "created_at"):
+    for key in (
+        "first_seen_at",
+        "run_completed_at",
+        "classified_at",
+        "announcement_date",
+        "created_at",
+    ):
         parsed = _parse_datetime(_coerce_str(row.get(key)))
         if parsed is not None:
             return parsed
@@ -253,7 +247,6 @@ def _is_after_cursor(row: Mapping[str, Any], cursor: Mapping[str, str]) -> bool:
 
 def build_since_last_run_rows(
     conn: sqlite3.Connection,
-    advance_cursor: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, str] | None, dict[str, str] | None]:
     rows = fetch_relevant_disclosures(conn)
     cursor_before = get_global_reporting_cursor(conn)
@@ -262,13 +255,20 @@ def build_since_last_run_rows(
         rows = [row for row in rows if _is_after_cursor(row, cursor_before)]
 
     latest_run = _latest_successful_ingest_run(conn)
-    if advance_cursor and latest_run is not None:
-        set_global_reporting_cursor(
-            conn,
-            run_id=latest_run["run_id"],
-            completed_at=latest_run["completed_at"],
-        )
     return rows, cursor_before, latest_run
+
+
+def advance_since_last_run_cursor(
+    conn: sqlite3.Connection,
+    cursor: Mapping[str, str] | None,
+) -> None:
+    if not cursor:
+        return
+    set_global_reporting_cursor(
+        conn,
+        run_id=str(cursor.get("run_id", "")),
+        completed_at=str(cursor.get("completed_at", "")),
+    )
 
 
 def _resolve_report_date(raw_value: str | None, now_utc: datetime | None = None) -> date:
@@ -388,6 +388,25 @@ def write_export(
     return resolved
 
 
+def export_since_last_run(
+    conn: sqlite3.Connection,
+    output_format: str,
+    output_path: str | None,
+    advance_cursor: bool = True,
+) -> tuple[Path, list[dict[str, Any]], dict[str, str] | None, dict[str, str] | None]:
+    rows, cursor_before, cursor_after = build_since_last_run_rows(conn)
+    written_path = write_export(
+        rows=rows,
+        fields=DISCLOSURE_EXPORT_FIELDS,
+        output_format=output_format,
+        output_path=output_path,
+        report_name="since_last_run",
+    )
+    if advance_cursor:
+        advance_since_last_run_cursor(conn, cursor_after)
+    return written_path, rows, cursor_before, cursor_after
+
+
 def _add_common_export_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--format",
@@ -460,16 +479,11 @@ def main() -> None:
         initialize_db(conn)
 
         if args.command == "since-last-run":
-            rows, cursor_before, cursor_after = build_since_last_run_rows(
-                conn,
-                advance_cursor=not args.no_advance_cursor,
-            )
-            output_path = write_export(
-                rows=rows,
-                fields=DISCLOSURE_EXPORT_FIELDS,
+            output_path, rows, cursor_before, cursor_after = export_since_last_run(
+                conn=conn,
                 output_format=args.format,
                 output_path=args.output,
-                report_name="since_last_run",
+                advance_cursor=not args.no_advance_cursor,
             )
             print(f"since-last-run rows={len(rows)} output={output_path}")
             print(f"cursor_before={cursor_before}")

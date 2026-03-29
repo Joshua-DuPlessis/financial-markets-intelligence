@@ -27,6 +27,7 @@ This app ingests JSE SENS announcements into SQLite, downloads PDFs, and prepare
 
 - PDF downloads are restricted to allowed hosts (`SENS_ALLOWED_PDF_HOSTS`).
 - HTTP download requests use retry + backoff.
+- PDF downloads are rate-limited with a minimum interval (`SENS_DOWNLOAD_MIN_INTERVAL_SECONDS`).
 - Downloaded files are validated as real PDFs before being persisted.
 - Use `.env` overrides for timeout/retry/user-agent tuning.
 - Scrape stage retries transient/empty weekday results with exponential backoff (`SENS_SCRAPE_MAX_ATTEMPTS`, `SENS_SCRAPE_RETRY_BACKOFF_SECONDS`).
@@ -34,10 +35,13 @@ This app ingests JSE SENS announcements into SQLite, downloads PDFs, and prepare
 - Weekend collection is disabled by default (`SENS_SKIP_WEEKENDS=1`) in Africa/Johannesburg timezone.
 - If weekend collection is enabled, zero-announcement runs log as info on weekends and warning on weekdays.
 - Candidate filtering and operator alerts are written to `ingest_events` for auditability.
+- Unknown-issuer candidates are quarantined into `ingest_events` (`stage='quarantine'`) for operator review.
 - Scheduler loop applies exponential cooldown after failed iterations and random jitter to reduce burst retries.
 - Candidate parsing enforces equity-issuer eligibility (mixed issuer labels are allowed when Equity Issuer is present).
 - Classification is deterministic and persisted (`category`, `classification_reason`, `classification_version`, `analyst_relevant`, `relevance_reason`).
 - Ambiguous title-only disclosures can use a lightweight PDF-text fallback for classification before final relevance decision.
+- First-seen lineage is persisted (`first_seen_run_id`, `first_seen_at`) for stable delta outputs.
+- Release-signal extraction persists future publication cues into `release_signals`.
 
 ## Local Setup
 
@@ -137,6 +141,12 @@ If you want to validate DB insert flow regardless of keyword filtering:
 python3 -m mvp_sens.scripts.fetch_sens --limit 20 --include-all --skip-download
 ```
 
+Strict dry-run mode (never download PDFs, including ambiguity fallback):
+
+```bash
+python3 -m mvp_sens.scripts.fetch_sens --dry-run --dry-run-no-download --limit 20
+```
+
 Generate analyst-facing outputs (on-demand CLI):
 
 ```bash
@@ -158,6 +168,7 @@ Output contract notes:
 - Disclosure export fields are stable and ordered, including `run_id`, `category`, `classification_reason`, `relevance_reason`, and observed timestamps.
 - Release-signal export fields are stable and ordered for downstream tooling.
 - `since-last-run` uses a single global cursor in `pipeline_state` (`run_id` + `completed_at`) for idempotent analyst deltas.
+- `since-last-run` advances cursor only after successful export write.
 
 ## Docker + Nginx Local Staging
 

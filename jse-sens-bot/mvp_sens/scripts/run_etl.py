@@ -42,6 +42,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip PDF download during fetch stage.",
     )
     parser.add_argument(
+        "--dry-run-no-download",
+        action="store_true",
+        help=(
+            "When used with --dry-run, prevent any PDF downloads "
+            "(including ambiguity fallback downloads)."
+        ),
+    )
+    parser.add_argument(
         "--parse-limit",
         type=int,
         default=None,
@@ -88,6 +96,7 @@ def main() -> None:
                 limit=args.fetch_limit,
                 dry_run=args.dry_run,
                 skip_download=args.skip_download,
+                dry_run_no_download=args.dry_run_no_download,
                 run_id=resolved_run_id,
                 source="run_etl",
             )

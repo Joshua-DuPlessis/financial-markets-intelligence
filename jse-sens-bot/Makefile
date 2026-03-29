@@ -1,4 +1,4 @@
-.PHONY: install prereqs test lint db-init dry-run fetch-live fetch-live-all parse review etl-offline scheduler-smoke audit-report analyst-since-last-run analyst-intraday analyst-daily-delta analyst-release-signals phase1-signoff docker-up docker-down docker-browser-install docker-live-fetch docker-live-fetch-all docker-scheduler-up docker-scheduler-down
+.PHONY: install prereqs test lint db-init dry-run dry-run-strict fetch-live fetch-live-all parse review etl-offline scheduler-smoke audit-report analyst-since-last-run analyst-intraday analyst-daily-delta analyst-release-signals phase1-signoff docker-up docker-down docker-browser-install docker-live-fetch docker-live-fetch-all docker-scheduler-up docker-scheduler-down
 
 install:
 	python3 -m pip install -r requirements-dev.txt
@@ -21,6 +21,9 @@ db-init:
 
 dry-run:
 	python3 -m mvp_sens.scripts.fetch_sens --dry-run --limit 5
+
+dry-run-strict:
+	python3 -m mvp_sens.scripts.fetch_sens --dry-run --dry-run-no-download --limit 5
 
 fetch-live:
 	python3 -m mvp_sens.scripts.fetch_sens --limit 20

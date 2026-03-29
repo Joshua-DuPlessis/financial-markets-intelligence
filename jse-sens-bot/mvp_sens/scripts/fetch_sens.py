@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +21,7 @@ from urllib3.util.retry import Retry
 from mvp_sens.configs.config import (
     ALLOWED_PDF_HOSTS,
     BASE_URL,
+    DOWNLOAD_MIN_INTERVAL_SECONDS,
     DOWNLOAD_BACKOFF_SECONDS,
     DOWNLOAD_RETRIES,
     KEYWORDS,
@@ -42,10 +45,12 @@ from mvp_sens.scripts.db_insert import (
     complete_ingest_run,
     connect_db,
     initialize_db,
+    insert_release_signal,
     insert_announcement,
     log_ingest_event,
     start_ingest_run,
 )
+from mvp_sens.scripts.release_signals import ReleaseSignal, extract_release_signals
 
 logger = logging.getLogger(__name__)
 JSE_TIMEZONE = ZoneInfo("Africa/Johannesburg")
@@ -96,9 +101,14 @@ class ScrapeResult:
     announcements: list[Announcement]
     raw_candidate_count: int
     reject_counts: dict[str, int]
+    quarantine_candidates: list[dict[str, str]] = field(default_factory=list)
     attempt_count: int = 1
     dom_change_suspected: bool = False
     alerts: list[str] = field(default_factory=list)
+
+
+_download_lock = threading.Lock()
+_last_download_monotonic: float | None = None
 
 
 def configure_logging() -> None:
@@ -236,12 +246,26 @@ def parse_raw_candidates(
     raw_candidates: list[tuple[str, str] | tuple[str, str, str]],
     limit: int | None = None,
 ) -> tuple[list[Announcement], dict[str, int]]:
+    announcements, reject_counts, _quarantine = parse_raw_candidates_with_quarantine(
+        raw_candidates=raw_candidates,
+        limit=limit,
+    )
+    return announcements, reject_counts
+
+
+def parse_raw_candidates_with_quarantine(
+    raw_candidates: list[tuple[str, str] | tuple[str, str, str]],
+    limit: int | None = None,
+) -> tuple[list[Announcement], dict[str, int], list[dict[str, str]]]:
     """
     Parse raw candidates into Announcement objects with explicit reject reasons.
+
+    Unknown-issuer candidates are captured to a quarantine list for operator review.
     """
     announcements: list[Announcement] = []
     reject_counts = _new_reject_counts()
     seen_ids: set[str] = set()
+    quarantine_candidates: list[dict[str, str]] = []
 
     for candidate in raw_candidates:
         raw_value, raw_title, raw_context = _unpack_raw_candidate(candidate)
@@ -279,6 +303,16 @@ def parse_raw_candidates(
             if not issuer_allowed:
                 if issuer_reason == REJECT_REASON_ISSUER_UNKNOWN:
                     reject_counts[REJECT_REASON_ISSUER_UNKNOWN] += 1
+                    quarantine_candidates.append(
+                        {
+                            "reason": REJECT_REASON_ISSUER_UNKNOWN,
+                            "raw_value": raw_value,
+                            "title": normalize_text(raw_title),
+                            "context": normalize_text(raw_context),
+                            "pdf_url": pdf_url,
+                            "sens_id": sens_id,
+                        }
+                    )
                 else:
                     reject_counts[REJECT_REASON_NON_EQUITY_ISSUER] += 1
                 continue
@@ -298,9 +332,9 @@ def parse_raw_candidates(
             )
 
             if limit is not None and len(announcements) >= limit:
-                return announcements, reject_counts
+                return announcements, reject_counts, quarantine_candidates
 
-    return announcements, reject_counts
+    return announcements, reject_counts, quarantine_candidates
 
 
 def get_scrape_retry_delay_seconds(attempt: int, base_backoff_seconds: float) -> float:
@@ -368,6 +402,22 @@ def _is_valid_pdf_file(path: Path) -> bool:
         return False
     with path.open("rb") as file_handle:
         return file_handle.read(5) == b"%PDF-"
+
+
+def _throttle_pdf_download() -> None:
+    global _last_download_monotonic
+    if DOWNLOAD_MIN_INTERVAL_SECONDS <= 0:
+        return
+
+    with _download_lock:
+        now = time.monotonic()
+        if _last_download_monotonic is not None:
+            elapsed = now - _last_download_monotonic
+            remaining = DOWNLOAD_MIN_INTERVAL_SECONDS - elapsed
+            if remaining > 0:
+                logger.info("Download throttling sleep %.2fs", remaining)
+                time.sleep(remaining)
+        _last_download_monotonic = time.monotonic()
 
 
 async def _collect_raw_candidates(page) -> list[tuple[str, str, str]]:
@@ -447,7 +497,7 @@ def _normalize_scrape_exception(exc: Exception) -> Exception:
 async def _scrape_once_with_playwright(
     playwright,
     limit: int | None = None,
-) -> tuple[int, list[Announcement], dict[str, int]]:
+) -> tuple[int, list[Announcement], dict[str, int], list[dict[str, str]]]:
     browser = await playwright.chromium.launch(headless=True)
     page = await browser.new_page()
     try:
@@ -455,11 +505,13 @@ async def _scrape_once_with_playwright(
         await page.goto(BASE_URL, wait_until="networkidle")
         raw_candidates = await _collect_raw_candidates(page)
         logger.info("Collected %s raw announcement candidates", len(raw_candidates))
-        announcements, reject_counts = parse_raw_candidates(
-            raw_candidates=raw_candidates,
-            limit=limit,
+        announcements, reject_counts, quarantine_candidates = (
+            parse_raw_candidates_with_quarantine(
+                raw_candidates=raw_candidates,
+                limit=limit,
+            )
         )
-        return len(raw_candidates), announcements, reject_counts
+        return len(raw_candidates), announcements, reject_counts, quarantine_candidates
     finally:
         await browser.close()
 
@@ -470,7 +522,8 @@ def _now_utc() -> datetime:
 
 async def _scrape_with_retry(
     scrape_once_fn: Callable[
-        [int | None], Awaitable[tuple[int, list[Announcement], dict[str, int]]]
+        [int | None],
+        Awaitable[tuple[int, list[Announcement], dict[str, int], list[dict[str, str]]]],
     ],
     limit: int | None,
     max_attempts: int,
@@ -486,7 +539,9 @@ async def _scrape_with_retry(
     for attempt in range(1, attempts + 1):
         now_utc = now_utc_fn()
         try:
-            raw_candidate_count, announcements, reject_counts = await scrape_once_fn(limit)
+            raw_candidate_count, announcements, reject_counts, quarantine_candidates = (
+                await scrape_once_fn(limit)
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -532,6 +587,7 @@ async def _scrape_with_retry(
             announcements=announcements,
             raw_candidate_count=raw_candidate_count,
             reject_counts=reject_counts,
+            quarantine_candidates=quarantine_candidates,
             attempt_count=attempt,
             dom_change_suspected=dom_change_suspected,
             alerts=alerts,
@@ -589,6 +645,7 @@ def download_pdf(pdf_url: str, sens_id: str) -> Path | None:
             return file_path
 
         temp_path = file_path.with_name(f"{file_path.stem}.{uuid4().hex}.tmp")
+        _throttle_pdf_download()
         with _build_http_session() as session:
             with session.get(pdf_url, timeout=REQUEST_TIMEOUT, stream=True) as response:
                 response.raise_for_status()
@@ -630,6 +687,66 @@ def extract_pdf_text_for_classification(pdf_path: Path, max_pages: int = 2) -> s
     except Exception as exc:
         logger.warning("Failed to extract PDF text for %s: %s", pdf_path, exc)
         return ""
+
+
+def _collect_release_signals(
+    title: str,
+    body_text: str = "",
+) -> list[ReleaseSignal]:
+    candidates = extract_release_signals(title, source="title")
+    if body_text:
+        candidates.extend(extract_release_signals(body_text, source="pdf"))
+
+    deduped: list[ReleaseSignal] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for signal in candidates:
+        key = (
+            signal.signal_type,
+            signal.signal_datetime,
+            signal.source_text,
+            signal.source,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(signal)
+    return deduped
+
+
+def _persist_release_signals(
+    *,
+    conn,
+    run_id: str,
+    sens_id: str,
+    signals: list[ReleaseSignal],
+) -> int:
+    inserted_count = 0
+    for signal in signals:
+        inserted = insert_release_signal(
+            conn=conn,
+            sens_id=sens_id,
+            signal_type=signal.signal_type,
+            signal_datetime=signal.signal_datetime,
+            source_text=signal.source_text,
+            source=signal.source,
+        )
+        if inserted:
+            inserted_count += 1
+
+    if signals:
+        log_ingest_event(
+            conn=conn,
+            run_id=run_id,
+            stage="release_signal",
+            event_type="info",
+            sens_id=sens_id,
+            message="Release signal extraction",
+            metadata={
+                "candidate_count": len(signals),
+                "inserted_count": inserted_count,
+            },
+        )
+    return inserted_count
 
 
 async def scrape_announcements(limit: int | None = None) -> ScrapeResult:
@@ -676,6 +793,7 @@ async def run_pipeline(
     limit: int | None = None,
     dry_run: bool = False,
     skip_download: bool = False,
+    dry_run_no_download: bool = False,
     include_all: bool = False,
     run_id: str | None = None,
     source: str = "sens_web",
@@ -693,6 +811,7 @@ async def run_pipeline(
     skipped_failed_download = 0
     run_status = "failed"
     run_error: str | None = None
+    effective_skip_download = skip_download or (dry_run and dry_run_no_download)
 
     with connect_db() as conn:
         initialize_db(conn)
@@ -711,6 +830,8 @@ async def run_pipeline(
             metadata={
                 "limit": limit,
                 "skip_download": skip_download,
+                "dry_run_no_download": dry_run_no_download,
+                "effective_skip_download": effective_skip_download,
                 "include_all": include_all,
                 "dry_run": dry_run,
             },
@@ -766,11 +887,22 @@ async def run_pipeline(
                     "raw_candidate_count": scrape_result.raw_candidate_count,
                     "scraped_count": scraped_count,
                     "reject_counts": scrape_result.reject_counts,
+                    "quarantine_count": len(scrape_result.quarantine_candidates),
                     "attempt_count": scrape_result.attempt_count,
                     "dom_change_suspected": scrape_result.dom_change_suspected,
                     "alerts": scrape_result.alerts,
                 },
             )
+            for quarantined in scrape_result.quarantine_candidates:
+                log_ingest_event(
+                    conn=conn,
+                    run_id=resolved_run_id,
+                    stage="quarantine",
+                    event_type="warning",
+                    sens_id=quarantined.get("sens_id"),
+                    message="Candidate quarantined: issuer context unknown",
+                    metadata=quarantined,
+                )
             if scrape_result.attempt_count > 1:
                 log_ingest_event(
                     conn=conn,
@@ -809,6 +941,7 @@ async def run_pipeline(
                 )
 
                 local_pdf_path = ""
+                classification_pdf_text = ""
                 disambiguation_attempted = False
                 disambiguation_succeeded = False
 
@@ -816,7 +949,7 @@ async def run_pipeline(
                     not include_all
                     and not classification.analyst_relevant
                     and classification.ambiguous
-                    and not skip_download
+                    and not effective_skip_download
                 ):
                     disambiguation_attempted = True
                     downloaded_path = download_pdf(item.pdf_url, item.sens_id)
@@ -834,11 +967,13 @@ async def run_pipeline(
                         continue
 
                     local_pdf_path = str(downloaded_path)
-                    pdf_text = extract_pdf_text_for_classification(downloaded_path)
+                    classification_pdf_text = extract_pdf_text_for_classification(
+                        downloaded_path
+                    )
                     classification = classify_announcement(
                         title=item.title,
                         issuer_context=item.issuer_context,
-                        body_text=pdf_text,
+                        body_text=classification_pdf_text,
                     )
                     disambiguation_succeeded = classification.analyst_relevant
 
@@ -874,11 +1009,25 @@ async def run_pipeline(
                     )
                     continue
 
+                release_signals: list[ReleaseSignal] = []
+                if classification.analyst_relevant:
+                    release_signals = _collect_release_signals(
+                        title=item.title,
+                        body_text=classification_pdf_text,
+                    )
+
                 if announcement_exists(conn, item.sens_id):
                     skipped_existing += 1
+                    if release_signals and not dry_run:
+                        _persist_release_signals(
+                            conn=conn,
+                            run_id=resolved_run_id,
+                            sens_id=item.sens_id,
+                            signals=release_signals,
+                        )
                     continue
 
-                if not skip_download and not local_pdf_path:
+                if not effective_skip_download and not local_pdf_path:
                     downloaded_path = download_pdf(item.pdf_url, item.sens_id)
                     if downloaded_path is None:
                         skipped_failed_download += 1
@@ -911,6 +1060,8 @@ async def run_pipeline(
                             "category": classification.category,
                             "classification_reason": classification.classification_reason,
                             "classification_version": CLASSIFICATION_VERSION,
+                            "first_seen_run_id": resolved_run_id,
+                            "first_seen_at": now_utc_iso(),
                             "classified_at": now_utc_iso(),
                             "analyst_relevant": classification.analyst_relevant,
                             "relevance_reason": classification.relevance_reason,
@@ -920,6 +1071,13 @@ async def run_pipeline(
                 if inserted_now:
                     inserted += 1
                     logger.info("Saved: %s", item.title)
+                    if release_signals:
+                        _persist_release_signals(
+                            conn=conn,
+                            run_id=resolved_run_id,
+                            sens_id=item.sens_id,
+                            signals=release_signals,
+                        )
 
             run_status = "success"
         except Exception as exc:
@@ -977,6 +1135,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip PDF download step and store records with empty local paths.",
     )
     parser.add_argument(
+        "--dry-run-no-download",
+        action="store_true",
+        help=(
+            "When used with --dry-run, prevent any PDF downloads "
+            "(including ambiguity fallback downloads)."
+        ),
+    )
+    parser.add_argument(
         "--include-all",
         action="store_true",
         help="Bypass keyword filtering and process all scraped announcements.",
@@ -1000,6 +1166,7 @@ def main() -> None:
             limit=args.limit,
             dry_run=args.dry_run,
             skip_download=args.skip_download,
+            dry_run_no_download=args.dry_run_no_download,
             include_all=args.include_all,
         )
     )

@@ -12,9 +12,10 @@ from mvp_sens.configs.config import DB_PATH, SCHEMA_PATH, ensure_runtime_dirs
 INSERT_SQL = """
 INSERT OR IGNORE INTO sens_financial_announcements
 (sens_id, company, title, announcement_date, pdf_url, local_pdf_path,
+ first_seen_run_id, first_seen_at,
  category, classification_reason, classification_version, classified_at,
  analyst_relevant, relevance_reason)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 INSERT_INGEST_RUN_SQL = """
@@ -110,6 +111,8 @@ def _ensure_announcements_migration_columns(conn: sqlite3.Connection) -> None:
         return
 
     column_defs = {
+        "first_seen_run_id": "TEXT",
+        "first_seen_at": "TEXT",
         "category": "TEXT NOT NULL DEFAULT 'other'",
         "classification_reason": "TEXT",
         "classification_version": "TEXT",
@@ -125,6 +128,13 @@ def _ensure_announcements_migration_columns(conn: sqlite3.Connection) -> None:
             "ALTER TABLE sens_financial_announcements "
             f"ADD COLUMN {column_name} {column_def}"
         )
+    conn.execute(
+        """
+        UPDATE sens_financial_announcements
+        SET first_seen_at = COALESCE(first_seen_at, created_at)
+        WHERE first_seen_at IS NULL
+        """
+    )
 
 
 def announcement_exists(conn: sqlite3.Connection, sens_id: str) -> bool:
@@ -161,6 +171,8 @@ def insert_announcement(conn: sqlite3.Connection, record: Mapping[str, Any]) -> 
             record["announcement_date"],
             record["pdf_url"],
             record["local_pdf_path"],
+            record.get("first_seen_run_id"),
+            record.get("first_seen_at"),
             str(record.get("category", "other")),
             record.get("classification_reason"),
             record.get("classification_version"),
