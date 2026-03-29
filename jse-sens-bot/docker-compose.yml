@@ -1,0 +1,33 @@
+services:
+  sens-scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jse-sens-bot:local
+    command:
+      [
+        "python",
+        "-m",
+        "mvp_sens.scripts.run_etl",
+        "--skip-fetch",
+        "--parse-limit",
+        "10",
+      ]
+    volumes:
+      - ./mvp_sens/data:/app/mvp_sens/data
+      - ./mvp_sens/db:/app/mvp_sens/db
+      - ./mvp_sens/logs:/app/mvp_sens/logs
+      - playwright-cache:/root/.cache/ms-playwright
+    restart: "no"
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./mvp_sens/docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./mvp_sens/data:/usr/share/nginx/html/data:ro
+    restart: unless-stopped
+
+volumes:
+  playwright-cache:
