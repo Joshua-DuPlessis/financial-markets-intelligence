@@ -18,7 +18,32 @@ services:
       - ./mvp_sens/db:/app/mvp_sens/db
       - ./mvp_sens/logs:/app/mvp_sens/logs
       - playwright-cache:/root/.cache/ms-playwright
+    environment:
+      - SENS_SKIP_WEEKENDS=1
     restart: "no"
+
+  sens-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jse-sens-bot:local
+    profiles: ["scheduler"]
+    command:
+      [
+        "python",
+        "-m",
+        "mvp_sens.scripts.scheduler_loop",
+        "--limit",
+        "20",
+      ]
+    volumes:
+      - ./mvp_sens/data:/app/mvp_sens/data
+      - ./mvp_sens/db:/app/mvp_sens/db
+      - ./mvp_sens/logs:/app/mvp_sens/logs
+      - playwright-cache:/root/.cache/ms-playwright
+    environment:
+      - SENS_SKIP_WEEKENDS=1
+    restart: unless-stopped
 
   nginx:
     image: nginx:1.27-alpine

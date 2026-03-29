@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import datetime, timezone
+from uuid import uuid4
 
 from mvp_sens.scripts.db_insert import init_database
 from mvp_sens.scripts.fetch_sens import run_pipeline
@@ -62,6 +64,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=5,
         help="How many parsed documents to print in final summary.",
     )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional run identifier for audit tracing.",
+    )
     return parser
 
 
@@ -72,13 +79,20 @@ def main() -> None:
     print("DB initialized")
 
     if not args.skip_fetch:
-        asyncio.run(
+        resolved_run_id = args.run_id or (
+            f"etl-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
+        )
+        print(f"Fetch run id: {resolved_run_id}")
+        finished_run_id = asyncio.run(
             run_pipeline(
                 limit=args.fetch_limit,
                 dry_run=args.dry_run,
                 skip_download=args.skip_download,
+                run_id=resolved_run_id,
+                source="run_etl",
             )
         )
+        print(f"Fetch run completed: {finished_run_id}")
     else:
         print("Fetch stage skipped")
 

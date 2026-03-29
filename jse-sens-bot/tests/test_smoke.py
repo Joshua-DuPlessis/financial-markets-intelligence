@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 import unittest
 
@@ -6,8 +7,10 @@ from mvp_sens.scripts.fetch_sens import (
     build_pdf_url,
     extract_sens_id,
     is_allowed_pdf_url,
+    is_weekend_in_jse_timezone,
     is_probable_announcement_url,
     is_relevant,
+    should_skip_collection_now,
 )
 
 
@@ -52,6 +55,16 @@ class SmokeTests(unittest.TestCase):
     def test_keyword_filter(self):
         self.assertTrue(is_relevant("ABC LTD | Audited Consolidated Results for year ended"))
         self.assertFalse(is_relevant("ABC LTD | Change in directorate"))
+
+    def test_weekend_detection_in_jse_timezone(self):
+        saturday_utc = datetime(2026, 3, 28, 10, 0, 0, tzinfo=timezone.utc)
+        monday_utc = datetime(2026, 3, 30, 10, 0, 0, tzinfo=timezone.utc)
+        self.assertTrue(is_weekend_in_jse_timezone(saturday_utc))
+        self.assertFalse(is_weekend_in_jse_timezone(monday_utc))
+
+    def test_should_skip_collection_now_weekend(self):
+        saturday_utc = datetime(2026, 3, 28, 10, 0, 0, tzinfo=timezone.utc)
+        self.assertTrue(should_skip_collection_now(saturday_utc))
 
 
 if __name__ == "__main__":

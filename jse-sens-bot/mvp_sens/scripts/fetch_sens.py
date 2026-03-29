@@ -4,10 +4,10 @@ import argparse
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 from urllib.parse import urljoin, urlparse
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -26,17 +26,36 @@ from mvp_sens.configs.config import (
     PDF_DIR,
     REQUEST_USER_AGENT,
     REQUEST_TIMEOUT,
+    SKIP_WEEKEND_COLLECTION,
+    SCRAPE_DOM_ALERT_MAX_RAW_CANDIDATES,
+    SCRAPE_MAX_ATTEMPTS,
+    SCRAPE_RETRY_BACKOFF_SECONDS,
     ensure_runtime_dirs,
+)
+from mvp_sens.scripts.classify_disclosures import (
+    CLASSIFICATION_VERSION,
+    classify_announcement,
+    evaluate_issuer_eligibility,
 )
 from mvp_sens.scripts.db_insert import (
     announcement_exists,
+    complete_ingest_run,
     connect_db,
     initialize_db,
     insert_announcement,
+    log_ingest_event,
+    start_ingest_run,
 )
 
 logger = logging.getLogger(__name__)
 JSE_TIMEZONE = ZoneInfo("Africa/Johannesburg")
+REJECT_REASON_NOT_PDF = "not_pdf_like_link"
+REJECT_REASON_DISALLOWED_HOST = "disallowed_host"
+REJECT_REASON_NOT_ANNOUNCEMENT = "not_probable_announcement_pdf"
+REJECT_REASON_MISSING_SENS_ID = "missing_sens_id"
+REJECT_REASON_DUPLICATE_SENS_ID = "duplicate_sens_id"
+REJECT_REASON_ISSUER_UNKNOWN = "issuer_unknown"
+REJECT_REASON_NON_EQUITY_ISSUER = "issuer_non_equity"
 
 PDF_URL_RE = re.compile(
     r"(https?://[^\s\"'()<>]+?\.pdf|/[^\s\"'()<>]*?\.pdf)",
@@ -51,9 +70,15 @@ class Announcement:
     title: str
     announcement_date: str
     pdf_url: str
+    issuer_context: str = ""
+    issuer_tags: tuple[str, ...] = ()
 
-    def as_record(self, local_pdf_path: str) -> dict[str, str]:
-        return {
+    def as_record(
+        self,
+        local_pdf_path: str,
+        extras: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        record: dict[str, Any] = {
             "sens_id": self.sens_id,
             "company": self.company,
             "title": self.title,
@@ -61,6 +86,19 @@ class Announcement:
             "pdf_url": self.pdf_url,
             "local_pdf_path": local_pdf_path,
         }
+        if extras:
+            record.update(extras)
+        return record
+
+
+@dataclass(frozen=True)
+class ScrapeResult:
+    announcements: list[Announcement]
+    raw_candidate_count: int
+    reject_counts: dict[str, int]
+    attempt_count: int = 1
+    dom_change_suspected: bool = False
+    alerts: list[str] = field(default_factory=list)
 
 
 def configure_logging() -> None:
@@ -154,14 +192,151 @@ def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _is_weekend_in_jse_timezone() -> bool:
-    return datetime.now(timezone.utc).astimezone(JSE_TIMEZONE).weekday() >= 5
+def is_weekend_in_jse_timezone(now_utc: datetime | None = None) -> bool:
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    return now_utc.astimezone(JSE_TIMEZONE).weekday() >= 5
 
 
-def _extract_urls_from_text(value: str) -> list[str]:
+def should_skip_collection_now(now_utc: datetime | None = None) -> bool:
+    return SKIP_WEEKEND_COLLECTION and is_weekend_in_jse_timezone(now_utc=now_utc)
+
+
+def extract_urls_from_text(value: str) -> list[str]:
     if not value:
         return []
     return [match.group(1) for match in PDF_URL_RE.finditer(value)]
+
+
+def _new_reject_counts() -> dict[str, int]:
+    return {
+        REJECT_REASON_NOT_PDF: 0,
+        REJECT_REASON_DISALLOWED_HOST: 0,
+        REJECT_REASON_NOT_ANNOUNCEMENT: 0,
+        REJECT_REASON_MISSING_SENS_ID: 0,
+        REJECT_REASON_DUPLICATE_SENS_ID: 0,
+        REJECT_REASON_ISSUER_UNKNOWN: 0,
+        REJECT_REASON_NON_EQUITY_ISSUER: 0,
+    }
+
+
+def _unpack_raw_candidate(raw_candidate: tuple[str, ...]) -> tuple[str, str, str]:
+    if len(raw_candidate) >= 3:
+        return str(raw_candidate[0]), str(raw_candidate[1]), str(raw_candidate[2])
+    if len(raw_candidate) == 2:
+        return str(raw_candidate[0]), str(raw_candidate[1]), ""
+    if len(raw_candidate) == 1:
+        return str(raw_candidate[0]), "", ""
+    return "", "", ""
+
+
+def parse_raw_candidates(
+    raw_candidates: list[tuple[str, str] | tuple[str, str, str]],
+    limit: int | None = None,
+) -> tuple[list[Announcement], dict[str, int]]:
+    """
+    Parse raw candidates into Announcement objects with explicit reject reasons.
+    """
+    announcements: list[Announcement] = []
+    reject_counts = _new_reject_counts()
+    seen_ids: set[str] = set()
+
+    for candidate in raw_candidates:
+        raw_value, raw_title, raw_context = _unpack_raw_candidate(candidate)
+        urls = extract_urls_from_text(raw_value)
+        if not urls:
+            urls = [raw_value]
+
+        for url_candidate in urls:
+            if not is_pdf_like_link(url_candidate):
+                reject_counts[REJECT_REASON_NOT_PDF] += 1
+                continue
+
+            pdf_url = build_pdf_url(url_candidate)
+            if not is_allowed_pdf_url(pdf_url):
+                reject_counts[REJECT_REASON_DISALLOWED_HOST] += 1
+                continue
+
+            if not is_probable_announcement_url(pdf_url):
+                reject_counts[REJECT_REASON_NOT_ANNOUNCEMENT] += 1
+                continue
+
+            sens_id = extract_sens_id(pdf_url)
+            if not sens_id:
+                reject_counts[REJECT_REASON_MISSING_SENS_ID] += 1
+                continue
+
+            if sens_id in seen_ids:
+                reject_counts[REJECT_REASON_DUPLICATE_SENS_ID] += 1
+                continue
+
+            issuer_allowed, issuer_reason, issuer_tags = evaluate_issuer_eligibility(
+                raw_title,
+                raw_context,
+            )
+            if not issuer_allowed:
+                if issuer_reason == REJECT_REASON_ISSUER_UNKNOWN:
+                    reject_counts[REJECT_REASON_ISSUER_UNKNOWN] += 1
+                else:
+                    reject_counts[REJECT_REASON_NON_EQUITY_ISSUER] += 1
+                continue
+
+            seen_ids.add(sens_id)
+            title = normalize_text(raw_title or sens_id)
+            announcements.append(
+                Announcement(
+                    sens_id=sens_id,
+                    company=infer_company(title),
+                    title=title,
+                    announcement_date=now_utc_iso(),
+                    pdf_url=pdf_url,
+                    issuer_context=normalize_text(raw_context),
+                    issuer_tags=issuer_tags,
+                )
+            )
+
+            if limit is not None and len(announcements) >= limit:
+                return announcements, reject_counts
+
+    return announcements, reject_counts
+
+
+def get_scrape_retry_delay_seconds(attempt: int, base_backoff_seconds: float) -> float:
+    normalized_attempt = max(1, attempt)
+    return max(0.0, base_backoff_seconds) * (2 ** (normalized_attempt - 1))
+
+
+def is_dom_change_suspected(
+    raw_candidate_count: int,
+    scraped_count: int,
+    now_utc: datetime | None = None,
+) -> bool:
+    if scraped_count > 0:
+        return False
+    if is_weekend_in_jse_timezone(now_utc=now_utc):
+        return False
+    return raw_candidate_count <= SCRAPE_DOM_ALERT_MAX_RAW_CANDIDATES
+
+
+def should_retry_after_scrape(
+    result: ScrapeResult,
+    attempt: int,
+    max_attempts: int,
+    now_utc: datetime | None = None,
+) -> bool:
+    if attempt >= max_attempts:
+        return False
+    if result.announcements:
+        return False
+    if is_weekend_in_jse_timezone(now_utc=now_utc):
+        return False
+    return result.raw_candidate_count == 0 or is_dom_change_suspected(
+        raw_candidate_count=result.raw_candidate_count,
+        scraped_count=len(result.announcements),
+        now_utc=now_utc,
+    )
 
 
 def _build_http_session() -> requests.Session:
@@ -195,41 +370,207 @@ def _is_valid_pdf_file(path: Path) -> bool:
         return file_handle.read(5) == b"%PDF-"
 
 
-async def _collect_raw_candidates(page) -> list[tuple[str, str]]:
+async def _collect_raw_candidates(page) -> list[tuple[str, str, str]]:
     """
-    Collect raw (href_like_value, title_text) candidates from page frames.
+    Collect raw candidates from page frames.
 
     This is intentionally broad to tolerate upstream DOM changes.
     """
-    candidates: list[tuple[str, str]] = []
+    candidates: list[tuple[str, str, str]] = []
 
     for frame in page.frames:
         anchors = await frame.query_selector_all("a[href]")
         for anchor in anchors:
             href = (await anchor.get_attribute("href")) or ""
             title = normalize_text((await anchor.inner_text()) or "")
+            context_text = normalize_text(
+                await anchor.evaluate(
+                    """
+                    node => {
+                      const container = node.closest('tr,li,article,section,div');
+                      return container ? (container.innerText || "") : "";
+                    }
+                    """
+                )
+            )
             if not href:
                 continue
             href_l = href.lower()
             if ".pdf" in href_l or "/documents/" in href_l:
-                candidates.append((href, title))
+                candidates.append((href, title, context_text))
 
         onclick_nodes = await frame.query_selector_all("[onclick]")
         for node in onclick_nodes:
             onclick_val = (await node.get_attribute("onclick")) or ""
             text = normalize_text((await node.inner_text()) or "")
+            context_text = normalize_text(
+                await node.evaluate(
+                    """
+                    node => {
+                      const container = node.closest('tr,li,article,section,div');
+                      return container ? (container.innerText || "") : "";
+                    }
+                    """
+                )
+            )
             if not onclick_val:
                 continue
             onclick_l = onclick_val.lower()
             if ".pdf" in onclick_l or "/documents/" in onclick_l:
-                candidates.append((onclick_val, text))
+                candidates.append((onclick_val, text, context_text))
 
         # Fallback: inspect frame HTML in case links are embedded in script payloads.
         html = await frame.content()
-        for embedded_url in _extract_urls_from_text(html):
-            candidates.append((embedded_url, ""))
+        for embedded_url in extract_urls_from_text(html):
+            candidates.append((embedded_url, "", ""))
 
     return candidates
+
+
+def _normalize_scrape_exception(exc: Exception) -> Exception:
+    msg = str(exc)
+    if "Executable doesn't exist" in msg:
+        return RuntimeError(
+            "Chromium browser is not installed for Playwright. "
+            "Run `python -m playwright install chromium` "
+            "before live fetch. For Docker Compose, use "
+            "`docker compose run --rm sens-scraper python -m playwright install chromium`."
+        )
+    if "error while loading shared libraries" in msg or "TargetClosedError" in msg:
+        return RuntimeError(
+            "Chromium failed to start because container system libraries are missing. "
+            "Rebuild image after Dockerfile dependency updates: `docker compose build --no-cache sens-scraper`."
+        )
+    return exc
+
+
+async def _scrape_once_with_playwright(
+    playwright,
+    limit: int | None = None,
+) -> tuple[int, list[Announcement], dict[str, int]]:
+    browser = await playwright.chromium.launch(headless=True)
+    page = await browser.new_page()
+    try:
+        page.set_default_timeout(45000)
+        await page.goto(BASE_URL, wait_until="networkidle")
+        raw_candidates = await _collect_raw_candidates(page)
+        logger.info("Collected %s raw announcement candidates", len(raw_candidates))
+        announcements, reject_counts = parse_raw_candidates(
+            raw_candidates=raw_candidates,
+            limit=limit,
+        )
+        return len(raw_candidates), announcements, reject_counts
+    finally:
+        await browser.close()
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+async def _scrape_with_retry(
+    scrape_once_fn: Callable[
+        [int | None], Awaitable[tuple[int, list[Announcement], dict[str, int]]]
+    ],
+    limit: int | None,
+    max_attempts: int,
+    base_backoff_seconds: float,
+    sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    now_utc_fn: Callable[[], datetime] = _now_utc,
+) -> ScrapeResult:
+    attempts = max(1, max_attempts)
+    dom_alert_message = (
+        "Potential DOM/API drift detected: low candidate volume without valid announcements."
+    )
+
+    for attempt in range(1, attempts + 1):
+        now_utc = now_utc_fn()
+        try:
+            raw_candidate_count, announcements, reject_counts = await scrape_once_fn(limit)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            normalized_exc = _normalize_scrape_exception(exc)
+            if attempt >= attempts:
+                if normalized_exc is exc:
+                    raise RuntimeError(
+                        f"Scrape failed after {attempts} attempt(s): {exc}"
+                    ) from exc
+                raise normalized_exc from exc
+            delay = get_scrape_retry_delay_seconds(
+                attempt=attempt,
+                base_backoff_seconds=base_backoff_seconds,
+            )
+            logger.warning(
+                "Scrape attempt %s/%s failed: %s. Retrying in %.1fs.",
+                attempt,
+                attempts,
+                normalized_exc,
+                delay,
+            )
+            await sleep_fn(delay)
+            continue
+
+        logger.info(
+            "Candidate filtering accepted=%s rejected=%s",
+            len(announcements),
+            sum(reject_counts.values()),
+        )
+        if sum(reject_counts.values()) > 0:
+            logger.info("Candidate reject breakdown: %s", reject_counts)
+
+        dom_change_suspected = is_dom_change_suspected(
+            raw_candidate_count=raw_candidate_count,
+            scraped_count=len(announcements),
+            now_utc=now_utc,
+        )
+        alerts: list[str] = []
+        if dom_change_suspected:
+            alerts.append(dom_alert_message)
+
+        result = ScrapeResult(
+            announcements=announcements,
+            raw_candidate_count=raw_candidate_count,
+            reject_counts=reject_counts,
+            attempt_count=attempt,
+            dom_change_suspected=dom_change_suspected,
+            alerts=alerts,
+        )
+
+        if should_retry_after_scrape(
+            result=result,
+            attempt=attempt,
+            max_attempts=attempts,
+            now_utc=now_utc,
+        ):
+            delay = get_scrape_retry_delay_seconds(
+                attempt=attempt,
+                base_backoff_seconds=base_backoff_seconds,
+            )
+            logger.warning(
+                "Scrape attempt %s/%s returned no usable announcements (raw_candidates=%s). "
+                "Retrying in %.1fs.",
+                attempt,
+                attempts,
+                raw_candidate_count,
+                delay,
+            )
+            await sleep_fn(delay)
+            continue
+
+        if not result.announcements:
+            if is_weekend_in_jse_timezone(now_utc=now_utc):
+                logger.info(
+                    "No announcements discovered on page. This can be normal on weekends (JSE timezone)."
+                )
+            else:
+                logger.warning(
+                    "No announcements discovered on page. This may indicate a DOM/API change at %s",
+                    BASE_URL,
+                )
+        return result
+
+    raise RuntimeError("Scrape attempts exhausted unexpectedly.")
 
 
 def download_pdf(pdf_url: str, sens_id: str) -> Path | None:
@@ -268,10 +609,30 @@ def download_pdf(pdf_url: str, sens_id: str) -> Path | None:
         return None
 
 
-async def scrape_announcements(limit: int | None = None) -> list[Announcement]:
-    results: list[Announcement] = []
-    seen_ids: set[str] = set()
+def extract_pdf_text_for_classification(pdf_path: Path, max_pages: int = 2) -> str:
+    try:
+        from pypdf import PdfReader
+    except Exception as exc:
+        logger.warning("pypdf unavailable for classification fallback: %s", exc)
+        return ""
 
+    try:
+        reader = PdfReader(str(pdf_path))
+        chunks: list[str] = []
+        for page_index, page in enumerate(reader.pages):
+            if max_pages > 0 and page_index >= max_pages:
+                break
+            text = page.extract_text() or ""
+            normalized = normalize_text(text)
+            if normalized:
+                chunks.append(normalized)
+        return "\n".join(chunks)
+    except Exception as exc:
+        logger.warning("Failed to extract PDF text for %s: %s", pdf_path, exc)
+        return ""
+
+
+async def scrape_announcements(limit: int | None = None) -> ScrapeResult:
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:
@@ -280,82 +641,15 @@ async def scrape_announcements(limit: int | None = None) -> list[Announcement]:
         ) from exc
 
     async with async_playwright() as playwright:
-        try:
-            browser = await playwright.chromium.launch(headless=True)
-        except Exception as exc:
-            msg = str(exc)
-            if "Executable doesn't exist" in msg:
-                raise RuntimeError(
-                    "Chromium browser is not installed for Playwright. "
-                    "Run `python -m playwright install chromium` "
-                    "before live fetch. For Docker Compose, use "
-                    "`docker compose run --rm sens-scraper python -m playwright install chromium`."
-                ) from exc
-            if "error while loading shared libraries" in msg or "TargetClosedError" in msg:
-                raise RuntimeError(
-                    "Chromium failed to start because container system libraries are missing. "
-                    "Rebuild image after Dockerfile dependency updates: `docker compose build --no-cache sens-scraper`."
-                ) from exc
-            raise
-        page = await browser.new_page()
-
-        try:
-            page.set_default_timeout(45000)
-            await page.goto(BASE_URL, wait_until="networkidle")
-            raw_candidates = await _collect_raw_candidates(page)
-            logger.info("Collected %s raw announcement candidates", len(raw_candidates))
-
-            for raw_value, raw_title in raw_candidates:
-                urls = _extract_urls_from_text(raw_value)
-                if not urls:
-                    urls = [raw_value]
-
-                for url_candidate in urls:
-                    if not is_pdf_like_link(url_candidate):
-                        continue
-
-                    pdf_url = build_pdf_url(url_candidate)
-                    if not is_allowed_pdf_url(pdf_url):
-                        continue
-                    if not is_probable_announcement_url(pdf_url):
-                        continue
-
-                    sens_id = extract_sens_id(pdf_url)
-
-                    if not sens_id or sens_id in seen_ids:
-                        continue
-
-                    seen_ids.add(sens_id)
-                    title = normalize_text(raw_title or sens_id)
-                    results.append(
-                        Announcement(
-                            sens_id=sens_id,
-                            company=infer_company(title),
-                            title=title,
-                            announcement_date=now_utc_iso(),
-                            pdf_url=pdf_url,
-                        )
-                    )
-
-                    if limit is not None and len(results) >= limit:
-                        break
-                if limit is not None and len(results) >= limit:
-                    break
-
-            if not results:
-                if _is_weekend_in_jse_timezone():
-                    logger.info(
-                        "No announcements discovered on page. This can be normal on weekends (JSE timezone)."
-                    )
-                else:
-                    logger.warning(
-                        "No announcements discovered on page. This may indicate a DOM/API change at %s",
-                        BASE_URL,
-                    )
-        finally:
-            await browser.close()
-
-    return results
+        return await _scrape_with_retry(
+            scrape_once_fn=lambda resolved_limit: _scrape_once_with_playwright(
+                playwright,
+                limit=resolved_limit,
+            ),
+            limit=limit,
+            max_attempts=SCRAPE_MAX_ATTEMPTS,
+            base_backoff_seconds=SCRAPE_RETRY_BACKOFF_SECONDS,
+        )
 
 
 def summarize_run(
@@ -383,57 +677,285 @@ async def run_pipeline(
     dry_run: bool = False,
     skip_download: bool = False,
     include_all: bool = False,
-) -> None:
+    run_id: str | None = None,
+    source: str = "sens_web",
+) -> str:
     ensure_runtime_dirs()
-    announcements = await scrape_announcements(limit=limit)
+    mode = "dry-run" if dry_run else "live"
+    resolved_run_id = run_id or (
+        f"sens-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
+    )
 
+    scraped_count = 0
     inserted = 0
     skipped_irrelevant = 0
     skipped_existing = 0
     skipped_failed_download = 0
+    run_status = "failed"
+    run_error: str | None = None
 
     with connect_db() as conn:
         initialize_db(conn)
+        start_ingest_run(
+            conn=conn,
+            run_id=resolved_run_id,
+            source=source,
+            mode=mode,
+        )
+        log_ingest_event(
+            conn=conn,
+            run_id=resolved_run_id,
+            stage="pipeline",
+            event_type="info",
+            message="Pipeline started",
+            metadata={
+                "limit": limit,
+                "skip_download": skip_download,
+                "include_all": include_all,
+                "dry_run": dry_run,
+            },
+        )
 
-        for item in announcements:
-            if not include_all and not is_relevant(item.title):
-                skipped_irrelevant += 1
-                logger.info(
-                    "Skipping non-keyword announcement sens_id=%s title=%s",
-                    item.sens_id,
-                    item.title,
+        if should_skip_collection_now():
+            run_status = "skipped"
+            skip_message = (
+                "Fetch skipped because weekend collection is disabled "
+                "(Africa/Johannesburg timezone)."
+            )
+            logger.info(skip_message)
+            log_ingest_event(
+                conn=conn,
+                run_id=resolved_run_id,
+                stage="scheduler",
+                event_type="info",
+                message=skip_message,
+            )
+            complete_ingest_run(
+                conn=conn,
+                run_id=resolved_run_id,
+                status=run_status,
+                scraped_count=scraped_count,
+                inserted_count=inserted,
+                skipped_irrelevant_count=skipped_irrelevant,
+                skipped_existing_count=skipped_existing,
+                skipped_failed_download_count=skipped_failed_download,
+                error_message=run_error,
+            )
+            summarize_run(
+                scraped=scraped_count,
+                inserted=inserted,
+                skipped_irrelevant=skipped_irrelevant,
+                skipped_existing=skipped_existing,
+                skipped_failed_download=skipped_failed_download,
+                dry_run=dry_run,
+            )
+            logger.info("Pipeline completed run_id=%s status=%s", resolved_run_id, run_status)
+            return resolved_run_id
+
+        try:
+            scrape_result = await scrape_announcements(limit=limit)
+            announcements = scrape_result.announcements
+            scraped_count = len(announcements)
+            log_ingest_event(
+                conn=conn,
+                run_id=resolved_run_id,
+                stage="scrape",
+                event_type="info",
+                message="Scrape completed",
+                metadata={
+                    "raw_candidate_count": scrape_result.raw_candidate_count,
+                    "scraped_count": scraped_count,
+                    "reject_counts": scrape_result.reject_counts,
+                    "attempt_count": scrape_result.attempt_count,
+                    "dom_change_suspected": scrape_result.dom_change_suspected,
+                    "alerts": scrape_result.alerts,
+                },
+            )
+            if scrape_result.attempt_count > 1:
+                log_ingest_event(
+                    conn=conn,
+                    run_id=resolved_run_id,
+                    stage="alert",
+                    event_type="warning",
+                    message="Scrape required retries before completion",
+                    metadata={"attempt_count": scrape_result.attempt_count},
                 )
-                continue
+            for alert_message in scrape_result.alerts:
+                log_ingest_event(
+                    conn=conn,
+                    run_id=resolved_run_id,
+                    stage="alert",
+                    event_type="warning",
+                    message=alert_message,
+                    metadata={
+                        "raw_candidate_count": scrape_result.raw_candidate_count,
+                        "scraped_count": scraped_count,
+                    },
+                )
+            if sum(scrape_result.reject_counts.values()) > 0:
+                log_ingest_event(
+                    conn=conn,
+                    run_id=resolved_run_id,
+                    stage="filter",
+                    event_type="info",
+                    message="Candidate filtering summary",
+                    metadata={"reject_counts": scrape_result.reject_counts},
+                )
 
-            if announcement_exists(conn, item.sens_id):
-                skipped_existing += 1
-                continue
+            for item in announcements:
+                classification = classify_announcement(
+                    title=item.title,
+                    issuer_context=item.issuer_context,
+                )
 
-            local_pdf_path = ""
-            if not skip_download:
-                downloaded_path = download_pdf(item.pdf_url, item.sens_id)
-                if downloaded_path is None:
-                    skipped_failed_download += 1
+                local_pdf_path = ""
+                disambiguation_attempted = False
+                disambiguation_succeeded = False
+
+                if (
+                    not include_all
+                    and not classification.analyst_relevant
+                    and classification.ambiguous
+                    and not skip_download
+                ):
+                    disambiguation_attempted = True
+                    downloaded_path = download_pdf(item.pdf_url, item.sens_id)
+                    if downloaded_path is None:
+                        skipped_failed_download += 1
+                        log_ingest_event(
+                            conn=conn,
+                            run_id=resolved_run_id,
+                            stage="download",
+                            event_type="warning",
+                            sens_id=item.sens_id,
+                            message="PDF download failed during disambiguation",
+                            metadata={"pdf_url": item.pdf_url},
+                        )
+                        continue
+
+                    local_pdf_path = str(downloaded_path)
+                    pdf_text = extract_pdf_text_for_classification(downloaded_path)
+                    classification = classify_announcement(
+                        title=item.title,
+                        issuer_context=item.issuer_context,
+                        body_text=pdf_text,
+                    )
+                    disambiguation_succeeded = classification.analyst_relevant
+
+                log_ingest_event(
+                    conn=conn,
+                    run_id=resolved_run_id,
+                    stage="classify",
+                    event_type="info",
+                    sens_id=item.sens_id,
+                    message="Classification decision",
+                    metadata={
+                        "category": classification.category,
+                        "classification_reason": classification.classification_reason,
+                        "classification_version": CLASSIFICATION_VERSION,
+                        "analyst_relevant": classification.analyst_relevant,
+                        "relevance_reason": classification.relevance_reason,
+                        "issuer_tags": list(classification.issuer_tags),
+                        "issuer_allowed": classification.issuer_allowed,
+                        "issuer_reason": classification.issuer_reason,
+                        "ambiguous": classification.ambiguous,
+                        "disambiguation_attempted": disambiguation_attempted,
+                        "disambiguation_succeeded": disambiguation_succeeded,
+                    },
+                )
+
+                if not include_all and not classification.analyst_relevant:
+                    skipped_irrelevant += 1
+                    logger.info(
+                        "Skipping non-relevant announcement sens_id=%s title=%s reason=%s",
+                        item.sens_id,
+                        item.title,
+                        classification.relevance_reason,
+                    )
                     continue
-                local_pdf_path = str(downloaded_path)
 
-            if dry_run:
-                logger.info("Dry run announcement: %s", item.title)
-                continue
+                if announcement_exists(conn, item.sens_id):
+                    skipped_existing += 1
+                    continue
 
-            inserted_now = insert_announcement(conn, item.as_record(local_pdf_path))
-            if inserted_now:
-                inserted += 1
-                logger.info("Saved: %s", item.title)
+                if not skip_download and not local_pdf_path:
+                    downloaded_path = download_pdf(item.pdf_url, item.sens_id)
+                    if downloaded_path is None:
+                        skipped_failed_download += 1
+                        log_ingest_event(
+                            conn=conn,
+                            run_id=resolved_run_id,
+                            stage="download",
+                            event_type="warning",
+                            sens_id=item.sens_id,
+                            message="PDF download failed",
+                            metadata={"pdf_url": item.pdf_url},
+                        )
+                        continue
+                    local_pdf_path = str(downloaded_path)
+
+                if dry_run:
+                    logger.info(
+                        "Dry run announcement: %s category=%s relevant=%s",
+                        item.title,
+                        classification.category,
+                        classification.analyst_relevant,
+                    )
+                    continue
+
+                inserted_now = insert_announcement(
+                    conn,
+                    item.as_record(
+                        local_pdf_path,
+                        extras={
+                            "category": classification.category,
+                            "classification_reason": classification.classification_reason,
+                            "classification_version": CLASSIFICATION_VERSION,
+                            "classified_at": now_utc_iso(),
+                            "analyst_relevant": classification.analyst_relevant,
+                            "relevance_reason": classification.relevance_reason,
+                        },
+                    ),
+                )
+                if inserted_now:
+                    inserted += 1
+                    logger.info("Saved: %s", item.title)
+
+            run_status = "success"
+        except Exception as exc:
+            run_error = str(exc)
+            log_ingest_event(
+                conn=conn,
+                run_id=resolved_run_id,
+                stage="pipeline",
+                event_type="error",
+                message="Pipeline failed",
+                metadata={"error": run_error},
+            )
+            raise
+        finally:
+            complete_ingest_run(
+                conn=conn,
+                run_id=resolved_run_id,
+                status=run_status,
+                scraped_count=scraped_count,
+                inserted_count=inserted,
+                skipped_irrelevant_count=skipped_irrelevant,
+                skipped_existing_count=skipped_existing,
+                skipped_failed_download_count=skipped_failed_download,
+                error_message=run_error,
+            )
 
     summarize_run(
-        scraped=len(announcements),
+        scraped=scraped_count,
         inserted=inserted,
         skipped_irrelevant=skipped_irrelevant,
         skipped_existing=skipped_existing,
         skipped_failed_download=skipped_failed_download,
         dry_run=dry_run,
     )
+    logger.info("Pipeline completed run_id=%s status=%s", resolved_run_id, run_status)
+    return resolved_run_id
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -473,7 +995,7 @@ def main() -> None:
     args = _build_parser().parse_args()
     logger.info("Starting SENS fetch pipeline")
     logger.info("Example commands: %s", " | ".join(_iter_example_commands()))
-    asyncio.run(
+    run_id = asyncio.run(
         run_pipeline(
             limit=args.limit,
             dry_run=args.dry_run,
@@ -481,6 +1003,7 @@ def main() -> None:
             include_all=args.include_all,
         )
     )
+    logger.info("Finished run_id=%s", run_id)
 
 
 if __name__ == "__main__":
