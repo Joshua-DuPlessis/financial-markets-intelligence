@@ -226,6 +226,23 @@
       cursor: help;
     }
 
+    /* ── Signal badges ── */
+    .signal-badge {
+      display: inline-flex;
+      align-items: center;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 4px;
+      letter-spacing: .5px;
+      white-space: nowrap;
+    }
+    .signal-buy  { background: rgba(52,211,153,.2); color: var(--accent2); }
+    .signal-hold { background: rgba(245,158,11,.2);  color: var(--warn); }
+    .signal-sell { background: rgba(239,68,68,.2);   color: var(--danger); }
+    .signal-cell { line-height: 1.6; }
+    .signal-reason { font-size: 10px; color: var(--muted); }
+
     /* ── Scrollable table body ── */
     .table-scroll { max-height: 520px; overflow-y: auto; }
     .table-scroll table { table-layout: fixed; }
@@ -298,12 +315,13 @@
               <th style="width:160px">Company</th>
               <th>Title</th>
               <th style="width:110px">Category</th>
+              <th style="width:140px">Signal</th>
               <th style="width:115px">Observed (JSE)</th>
               <th style="width:80px">PDF</th>
             </tr>
           </thead>
           <tbody id="disclosures-tbody">
-            <tr class="empty-row"><td colspan="5">Loading…</td></tr>
+            <tr class="empty-row"><td colspan="6">Loading…</td></tr>
           </tbody>
         </table>
       </div>
@@ -477,13 +495,27 @@ async function loadStatus() {
   }
 }
 
+function signalBadge(sig) {
+  if (!sig) return '<span class="signal-badge signal-hold">HOLD</span>';
+  const cls = { BUY: 'signal-buy', HOLD: 'signal-hold', SELL: 'signal-sell' }[sig.signal] || 'signal-hold';
+  return `<div class="signal-cell">
+    <span class="signal-badge ${cls}">${esc(sig.signal)} ${sig.confidence}%</span>
+    <div class="signal-reason">${esc(sig.reason)}</div>
+  </div>`;
+}
+
 // ─── Load disclosures ─────────────────────────────────────────────────────────
 async function loadDisclosures() {
   const tbody = document.getElementById('disclosures-tbody');
   try {
-    const rows = await apiFetch('/api/disclosures?limit=100');
+    const [rows, sigRows] = await Promise.all([
+      apiFetch('/api/disclosures?limit=100'),
+      apiFetch('/api/signals?limit=100'),
+    ]);
+    const sigMap = {};
+    for (const s of sigRows) sigMap[s.sens_id] = s;
     if (!rows.length) {
-      tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No relevant disclosures found.</td></tr>';
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No relevant disclosures found.</td></tr>';
       return;
     }
     tbody.innerHTML = rows.map(r => `
@@ -491,6 +523,7 @@ async function loadDisclosures() {
         <td><strong>${esc(r.company)}</strong></td>
         <td class="truncate" title="${esc(r.title)}">${esc(r.title)}</td>
         <td>${categoryPill(r.category)}</td>
+        <td>${signalBadge(sigMap[r.sens_id])}</td>
         <td class="mono">${fmtDate(r.observed_at_jse || r.observed_at_utc)}</td>
         <td>${r.pdf_url
           ? `<a href="${esc(r.pdf_url)}" target="_blank" rel="noopener noreferrer"
@@ -498,7 +531,7 @@ async function loadDisclosures() {
           : '<span style="color:var(--muted)">—</span>'}</td>
       </tr>`).join('');
   } catch (e) {
-    tbody.innerHTML = `<tr class="empty-row"><td colspan="5">Failed to load disclosures.</td></tr>`;
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="6">Failed to load disclosures.</td></tr>`;
   }
 }
 

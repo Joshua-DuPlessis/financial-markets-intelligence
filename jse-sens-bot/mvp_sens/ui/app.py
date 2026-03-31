@@ -23,6 +23,7 @@ from mvp_sens.scripts.analyst_outputs import (
 )
 from mvp_sens.scripts.audit_report import fetch_recent_alert_events, fetch_recent_runs
 from mvp_sens.scripts.db_insert import connect_db, initialize_db
+from mvp_sens.signals import generate_signal_for_disclosure
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -161,6 +162,18 @@ def api_release_signals() -> object:
         initialize_db(conn)
         rows = build_release_signal_rows(conn, include_past=include_past)
     return jsonify(rows)
+
+
+@app.route("/api/signals")
+def api_signals() -> object:
+    """Return BUY / HOLD / SELL signals for analyst-relevant disclosures."""
+    limit = _safe_limit(request.args.get("limit"), 50)
+    if not _db_connected():
+        return jsonify([])
+    with connect_db() as conn:
+        initialize_db(conn)
+        rows = fetch_relevant_disclosures(conn)
+    return jsonify([generate_signal_for_disclosure(row) for row in rows[:limit]])
 
 
 # ---------------------------------------------------------------------------

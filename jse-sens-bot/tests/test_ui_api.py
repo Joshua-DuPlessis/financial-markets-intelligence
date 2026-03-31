@@ -222,6 +222,58 @@ class ApiReleaseSignalsTests(unittest.TestCase):
         self.assertEqual(data, [])
 
 
+class ApiSignalsTests(unittest.TestCase):
+    def setUp(self):
+        self.client = app.test_client()
+        self._conn = _make_memory_conn()
+
+    def tearDown(self):
+        self._conn.close()
+
+    def _patch_db(self):
+        return patch("mvp_sens.ui.app.connect_db", return_value=self._conn)
+
+    def test_signals_empty_when_no_disclosures(self):
+        with self._patch_db():
+            data = self.client.get("/api/signals").get_json()
+        self.assertEqual(data, [])
+
+    def test_signals_returns_one_per_disclosure(self):
+        _insert_announcement(self._conn, "SIG001")
+        with self._patch_db():
+            data = self.client.get("/api/signals").get_json()
+        self.assertEqual(len(data), 1)
+
+    def test_signals_schema(self):
+        _insert_announcement(self._conn, "SIG002")
+        with self._patch_db():
+            data = self.client.get("/api/signals").get_json()
+        row = data[0]
+        for key in ("sens_id", "company", "signal", "confidence", "reason"):
+            self.assertIn(key, row)
+
+    def test_signals_valid_values(self):
+        _insert_announcement(self._conn, "SIG003")
+        with self._patch_db():
+            data = self.client.get("/api/signals").get_json()
+        row = data[0]
+        self.assertIn(row["signal"], ("BUY", "HOLD", "SELL"))
+        self.assertGreaterEqual(row["confidence"], 0.0)
+        self.assertLessEqual(row["confidence"], 100.0)
+
+    def test_signals_returns_200(self):
+        with self._patch_db():
+            resp = self.client.get("/api/signals")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_signals_limit_param(self):
+        for i in range(5):
+            _insert_announcement(self._conn, f"SIG10{i}")
+        with self._patch_db():
+            data = self.client.get("/api/signals?limit=2").get_json()
+        self.assertLessEqual(len(data), 2)
+
+
 class IndexRouteTests(unittest.TestCase):
     def setUp(self):
         self.client = app.test_client()

@@ -199,6 +199,111 @@ docker compose --profile scheduler stop sens-scheduler
 Nginx serves local artifacts on `http://localhost:8080/data/`.
 Health check endpoint: `http://localhost:8080/healthz`.
 
+## Phase 2 Decision-Support Features
+
+### BUY / HOLD / SELL Signal Engine (`mvp_sens/signals.py`)
+
+The signal engine analyses each analyst-relevant disclosure and produces an
+actionable verdict:
+
+| Signal | Colour | Meaning |
+|--------|--------|---------|
+| **BUY**  | 🟢 green  | Positive sentiment or confirmed uptrend |
+| **HOLD** | 🟡 yellow | Mixed or neutral evidence |
+| **SELL** | 🔴 red    | Negative sentiment or confirmed downtrend |
+
+Each signal also carries a **confidence score** (0–100 %) and a short **reason**
+string (e.g. `"Positive sentiment"` or `"Uptrend + positive sentiment"`).
+
+When price history is available the engine computes short and long simple
+moving averages (defaults: 5-period and 20-period) and combines the resulting
+trend score with a sentiment score using configurable weights.  When no price
+history is available the engine falls back to sentiment derived directly from
+the disclosure's `category` and `analyst_relevant` fields.
+
+**Sentiment mapping (no price data needed):**
+
+| Category | Base sentiment |
+|----------|----------------|
+| `financial_results` | +0.30 |
+| `earnings_update`   | +0.25 |
+| `trading_statement` | 0.00  |
+| `other`             | 0.00  |
+
+An extra +0.10 boost is applied when `analyst_relevant = 1`.
+
+**Example output:**
+
+```json
+{
+  "sens_id": "20260330-001",
+  "company": "ACME Ltd",
+  "signal": "BUY",
+  "confidence": 70.0,
+  "reason": "Positive sentiment"
+}
+```
+
+**API endpoint:** `GET /api/signals[?limit=N]`
+
+Returns signals for up to *N* analyst-relevant disclosures (default 50, max 200).
+
+```bash
+curl http://localhost:5000/api/signals | python3 -m json.tool
+```
+
+**All threshold constants** are defined at the top of `mvp_sens/signals.py` and
+can be overridden without touching the core logic.
+
+---
+
+### Alert System (`mvp_sens/alerts.py`)
+
+`check_alerts(asset_data, thresholds)` evaluates a snapshot of asset data
+against four configurable conditions and returns a list of triggered alerts.
+
+**Supported alert types:**
+
+| Type | Condition |
+|------|-----------|
+| `price_above` | `price > thresholds["price_above"]` |
+| `price_below` | `price < thresholds["price_below"]` |
+| `pct_change`  | `|% change vs prev_price| ≥ threshold` (default 5 %) |
+| `volume_spike` | `volume / avg_volume ≥ factor` (default 2×) |
+
+**Example usage:**
+
+```python
+from mvp_sens.alerts import check_alerts
+
+alerts = check_alerts(
+    {"symbol": "ACM", "price": 110.0, "prev_price": 100.0,
+     "volume": 300_000, "avg_volume": 100_000},
+    {"price_above": 105.0, "pct_change": 5.0, "volume_spike_factor": 2.0},
+)
+# [
+#   {"type": "price_above", "symbol": "ACM",
+#    "message": "ACM price 110.00 crossed above threshold 105.00", "value": 110.0},
+#   {"type": "pct_change",  "symbol": "ACM",
+#    "message": "ACM moved up 10.0% (threshold: 5.0%)", "value": 10.0},
+#   {"type": "volume_spike","symbol": "ACM",
+#    "message": "ACM volume spike: 300,000 (3.0x avg, threshold: 2.0x)", "value": 3.0}
+# ]
+```
+
+**In-app alert display:** triggered alerts are displayed in the *Alert Events*
+tab of the dashboard.
+
+**API endpoint:** `GET /api/alerts[?limit=N&run_id=<run_id>]`
+
+Returns recent pipeline alert events from the `ingest_events` table.
+
+**Default thresholds** are constants at the top of `mvp_sens/alerts.py` —
+no hardcoded magic numbers anywhere else.
+
+---
+
+
 ## Phase 1 Closeout
 
 - Release labeling: this is tracked as **Phase 1 Release 4** (final Phase 1 release).
