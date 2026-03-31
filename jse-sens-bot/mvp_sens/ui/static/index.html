@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JSE SENS Intelligence</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #22263a;
+      --border: #2e3350;
+      --accent: #4f8ef7;
+      --accent2: #34d399;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+      --text: #e2e8f0;
+      --muted: #64748b;
+      --radius: 8px;
+      --font: 'Inter', system-ui, -apple-system, sans-serif;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 56px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 16px;
+      letter-spacing: -.3px;
+    }
+    .logo-icon {
+      width: 28px; height: 28px;
+      background: var(--accent);
+      border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 15px;
+    }
+    .header-meta {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .refresh-btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 5px 14px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 12px;
+      transition: background .15s;
+    }
+    .refresh-btn:hover { background: var(--border); }
+
+    /* ── Main layout ── */
+    main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+    /* ── Stat cards ── */
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+    }
+    .card-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .8px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+    .card-value {
+      font-size: 28px;
+      font-weight: 700;
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+    .card-sub { font-size: 11px; color: var(--muted); }
+    .card-value.accent { color: var(--accent); }
+    .card-value.green { color: var(--accent2); }
+    .card-value.warn { color: var(--warn); }
+    .pill {
+      display: inline-block;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 20px;
+      font-weight: 600;
+    }
+    .pill-green { background: rgba(52,211,153,.15); color: var(--accent2); }
+    .pill-red { background: rgba(239,68,68,.15); color: var(--danger); }
+    .pill-warn { background: rgba(245,158,11,.15); color: var(--warn); }
+    .pill-blue { background: rgba(79,142,247,.15); color: var(--accent); }
+    .pill-muted { background: var(--surface2); color: var(--muted); }
+
+    /* ── Tabs ── */
+    .tabs {
+      display: flex;
+      gap: 4px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 20px;
+    }
+    .tab-btn {
+      background: none;
+      border: none;
+      color: var(--muted);
+      padding: 10px 18px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+      transition: color .15s;
+    }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* ── Table ── */
+    .table-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .table-toolbar {
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+    .table-title {
+      font-weight: 600;
+      font-size: 13px;
+      flex: 1;
+    }
+    .search-input {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 6px 12px;
+      border-radius: var(--radius);
+      font-size: 12px;
+      width: 220px;
+    }
+    .search-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th {
+      background: var(--surface2);
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .6px;
+      padding: 10px 14px;
+      text-align: left;
+      font-weight: 600;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    td {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+      font-size: 13px;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255,255,255,.02); }
+    .truncate { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mono { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); }
+    .empty-row td {
+      text-align: center;
+      color: var(--muted);
+      padding: 32px;
+      font-style: italic;
+    }
+
+    /* ── Loading/error ── */
+    .loading { color: var(--muted); text-align: center; padding: 32px; }
+    .error-msg { color: var(--danger); text-align: center; padding: 20px; font-size: 12px; }
+
+    /* ── Source text tooltip ── */
+    .source-text {
+      max-width: 280px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      cursor: help;
+    }
+
+    /* ── Scrollable table body ── */
+    .table-scroll { max-height: 520px; overflow-y: auto; }
+    .table-scroll table { table-layout: fixed; }
+
+    @media (max-width: 768px) {
+      main { padding: 16px; }
+      .cards { grid-template-columns: 1fr 1fr; }
+      .search-input { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">📊</div>
+    JSE SENS Intelligence
+  </div>
+  <div class="header-meta">
+    <span id="last-updated">Loading…</span>
+    <button class="refresh-btn" onclick="refresh()">↻ Refresh</button>
+  </div>
+</header>
+
+<main>
+  <!-- Stat cards -->
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">Relevant Disclosures</div>
+      <div class="card-value accent" id="stat-relevant">—</div>
+      <div class="card-sub" id="stat-total">— total in DB</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Pending Signals</div>
+      <div class="card-value warn" id="stat-signals">—</div>
+      <div class="card-sub">upcoming release signals</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Last Run</div>
+      <div class="card-value" id="stat-last-run" style="font-size:16px">—</div>
+      <div class="card-sub" id="stat-last-run-time">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Database</div>
+      <div class="card-value" id="stat-db">—</div>
+      <div class="card-sub">SQLite pipeline store</div>
+    </div>
+  </div>
+
+  <!-- Tab navigation -->
+  <div class="tabs">
+    <button class="tab-btn active" onclick="showTab('disclosures', this)">Disclosures</button>
+    <button class="tab-btn" onclick="showTab('signals', this)">Release Signals</button>
+    <button class="tab-btn" onclick="showTab('runs', this)">Ingest Runs</button>
+    <button class="tab-btn" onclick="showTab('alerts', this)">Alert Events</button>
+  </div>
+
+  <!-- Disclosures panel -->
+  <div id="tab-disclosures" class="tab-panel active">
+    <div class="table-wrap">
+      <div class="table-toolbar">
+        <span class="table-title">Analyst-Relevant SENS Announcements</span>
+        <input class="search-input" type="search" placeholder="Filter by company or title…"
+               oninput="filterTable('disclosures-tbody', this.value)" />
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:160px">Company</th>
+              <th>Title</th>
+              <th style="width:110px">Category</th>
+              <th style="width:115px">Observed (JSE)</th>
+              <th style="width:80px">PDF</th>
+            </tr>
+          </thead>
+          <tbody id="disclosures-tbody">
+            <tr class="empty-row"><td colspan="5">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Release Signals panel -->
+  <div id="tab-signals" class="tab-panel">
+    <div class="table-wrap">
+      <div class="table-toolbar">
+        <span class="table-title">Upcoming Release Signals</span>
+        <input class="search-input" type="search" placeholder="Filter by company…"
+               oninput="filterTable('signals-tbody', this.value)" />
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:160px">Company</th>
+              <th style="width:130px">Signal Date (JSE)</th>
+              <th style="width:120px">Signal Type</th>
+              <th style="width:110px">Category</th>
+              <th>Source Text</th>
+            </tr>
+          </thead>
+          <tbody id="signals-tbody">
+            <tr class="empty-row"><td colspan="5">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Ingest Runs panel -->
+  <div id="tab-runs" class="tab-panel">
+    <div class="table-wrap">
+      <div class="table-toolbar">
+        <span class="table-title">Recent Ingest Runs</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:180px">Run ID</th>
+              <th style="width:80px">Status</th>
+              <th style="width:80px">Mode</th>
+              <th style="width:70px">Scraped</th>
+              <th style="width:70px">Inserted</th>
+              <th style="width:80px">Skipped</th>
+              <th style="width:145px">Completed At</th>
+            </tr>
+          </thead>
+          <tbody id="runs-tbody">
+            <tr class="empty-row"><td colspan="7">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Alert Events panel -->
+  <div id="tab-alerts" class="tab-panel">
+    <div class="table-wrap">
+      <div class="table-toolbar">
+        <span class="table-title">Alert Events</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:145px">Timestamp</th>
+              <th style="width:140px">Run ID</th>
+              <th style="width:160px">Event Type</th>
+              <th>Message</th>
+            </tr>
+          </thead>
+          <tbody id="alerts-tbody">
+            <tr class="empty-row"><td colspan="4">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+// ─── Tab switching ───────────────────────────────────────────────────────────
+function showTab(name, btn) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  btn.classList.add('active');
+}
+
+// ─── Live search filter ───────────────────────────────────────────────────────
+function filterTable(tbodyId, query) {
+  const q = query.toLowerCase();
+  const tbody = document.getElementById(tbodyId);
+  if (!tbody) return;
+  for (const row of tbody.rows) {
+    if (row.classList.contains('empty-row')) continue;
+    row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+  }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function esc(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function fmtDate(iso) {
+  if (!iso) return '—';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString('en-ZA', { timeZone: 'Africa/Johannesburg',
+      year: 'numeric', month: 'short', day: '2-digit',
+      hour: '2-digit', minute: '2-digit' });
+  } catch { return iso; }
+}
+
+function categoryPill(cat) {
+  const map = {
+    trading_statement: ['pill-warn', 'Trading Stmt'],
+    financial_results: ['pill-blue', 'Fin. Results'],
+    earnings_update:   ['pill-green', 'Earnings'],
+  };
+  const [cls, label] = map[cat] || ['pill-muted', cat || '—'];
+  return `<span class="pill ${cls}">${esc(label)}</span>`;
+}
+
+function statusPill(status) {
+  const map = { success: 'pill-green', error: 'pill-red', running: 'pill-warn' };
+  return `<span class="pill ${map[status] || 'pill-muted'}">${esc(status)}</span>`;
+}
+
+function setEl(id, html) {
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = html;
+}
+
+// ─── API fetch wrapper ────────────────────────────────────────────────────────
+async function apiFetch(path) {
+  const resp = await fetch(path);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  return resp.json();
+}
+
+// ─── Load status cards ────────────────────────────────────────────────────────
+async function loadStatus() {
+  try {
+    const s = await apiFetch('/api/status');
+    setEl('stat-relevant', s.total_relevant ?? '0');
+    setEl('stat-total', `${s.total_disclosures ?? 0} total in DB`);
+    setEl('stat-signals', s.pending_signals ?? '0');
+    if (s.last_run) {
+      setEl('stat-last-run', statusPill(s.last_run.status));
+      setEl('stat-last-run-time', fmtDate(s.last_run.completed_at));
+    } else {
+      setEl('stat-last-run', '—');
+      setEl('stat-last-run-time', 'No runs yet');
+    }
+    setEl('stat-db', s.db_connected
+      ? '<span class="pill pill-green">Connected</span>'
+      : '<span class="pill pill-red">Offline</span>');
+  } catch (e) {
+    setEl('stat-db', '<span class="pill pill-red">Error</span>');
+  }
+}
+
+// ─── Load disclosures ─────────────────────────────────────────────────────────
+async function loadDisclosures() {
+  const tbody = document.getElementById('disclosures-tbody');
+  try {
+    const rows = await apiFetch('/api/disclosures?limit=100');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No relevant disclosures found.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td><strong>${esc(r.company)}</strong></td>
+        <td class="truncate" title="${esc(r.title)}">${esc(r.title)}</td>
+        <td>${categoryPill(r.category)}</td>
+        <td class="mono">${fmtDate(r.observed_at_jse || r.observed_at_utc)}</td>
+        <td>${r.pdf_url
+          ? `<a href="${esc(r.pdf_url)}" target="_blank" rel="noopener noreferrer"
+               style="color:var(--accent);text-decoration:none">PDF ↗</a>`
+          : '<span style="color:var(--muted)">—</span>'}</td>
+      </tr>`).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="5">Failed to load disclosures.</td></tr>`;
+  }
+}
+
+// ─── Load release signals ─────────────────────────────────────────────────────
+async function loadSignals() {
+  const tbody = document.getElementById('signals-tbody');
+  try {
+    const rows = await apiFetch('/api/release-signals');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No upcoming release signals.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td><strong>${esc(r.company)}</strong></td>
+        <td class="mono">${fmtDate(r.signal_datetime_jse || r.signal_datetime)}</td>
+        <td>${esc(r.signal_type)}</td>
+        <td>${categoryPill(r.category)}</td>
+        <td class="source-text" title="${esc(r.source_text)}">${esc(r.source_text)}</td>
+      </tr>`).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="5">Failed to load signals.</td></tr>`;
+  }
+}
+
+// ─── Load ingest runs ─────────────────────────────────────────────────────────
+async function loadRuns() {
+  const tbody = document.getElementById('runs-tbody');
+  try {
+    const rows = await apiFetch('/api/runs?limit=20');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="7">No ingest runs recorded yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(r => {
+      const skipped = (r.skipped_irrelevant_count || 0)
+        + (r.skipped_existing_count || 0)
+        + (r.skipped_failed_download_count || 0);
+      return `<tr>
+        <td class="mono truncate" title="${esc(r.run_id)}">${esc(r.run_id)}</td>
+        <td>${statusPill(r.status)}</td>
+        <td><span class="pill pill-muted">${esc(r.mode)}</span></td>
+        <td>${r.scraped_count ?? '—'}</td>
+        <td>${r.inserted_count ?? '—'}</td>
+        <td>${skipped}</td>
+        <td class="mono">${fmtDate(r.completed_at)}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="7">Failed to load runs.</td></tr>`;
+  }
+}
+
+// ─── Load alert events ────────────────────────────────────────────────────────
+async function loadAlerts() {
+  const tbody = document.getElementById('alerts-tbody');
+  try {
+    const rows = await apiFetch('/api/alerts?limit=30');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="4">No alert events recorded.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td class="mono">${fmtDate(r.created_at)}</td>
+        <td class="mono truncate" title="${esc(r.run_id)}">${esc(r.run_id)}</td>
+        <td><span class="pill pill-warn">${esc(r.event_type)}</span></td>
+        <td>${esc(r.message)}</td>
+      </tr>`).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="4">Failed to load alerts.</td></tr>`;
+  }
+}
+
+// ─── Full refresh ─────────────────────────────────────────────────────────────
+async function refresh() {
+  const ts = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+  document.getElementById('last-updated').textContent = `Updated ${ts} SAST`;
+  await Promise.all([loadStatus(), loadDisclosures(), loadSignals(), loadRuns(), loadAlerts()]);
+}
+
+// ─── Auto-refresh every 60 s ──────────────────────────────────────────────────
+refresh();
+setInterval(refresh, 60_000);
+</script>
+</body>
+</html>

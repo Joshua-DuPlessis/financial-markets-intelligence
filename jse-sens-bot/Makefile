@@ -1,4 +1,4 @@
-.PHONY: install prereqs test lint db-init dry-run dry-run-strict fetch-live fetch-live-all parse review etl-offline scheduler-smoke audit-report analyst-since-last-run analyst-intraday analyst-daily-delta analyst-release-signals phase1-signoff docker-up docker-down docker-browser-install docker-live-fetch docker-live-fetch-all docker-scheduler-up docker-scheduler-down
+.PHONY: install prereqs test lint db-init dry-run dry-run-strict fetch-live fetch-live-all parse review etl-offline scheduler-smoke audit-report analyst-since-last-run analyst-intraday analyst-daily-delta analyst-release-signals phase1-signoff docker-up docker-down docker-browser-install docker-live-fetch docker-live-fetch-all docker-scheduler-up docker-scheduler-down ui
 
 install:
 	python3 -m pip install -r requirements-dev.txt
@@ -80,3 +80,6 @@ docker-scheduler-up:
 
 docker-scheduler-down:
 	docker compose --profile scheduler stop sens-scheduler
+
+ui:
+	python3 -m mvp_sens.ui.app
