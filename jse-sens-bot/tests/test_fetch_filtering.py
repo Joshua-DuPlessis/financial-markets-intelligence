@@ -4,9 +4,12 @@ import unittest
 
 from mvp_sens.scripts.fetch_sens import (
     ScrapeResult,
+    _unpack_raw_candidate,
+    extract_company_from_context,
     extract_urls_from_text,
     get_scrape_retry_delay_seconds,
     is_dom_change_suspected,
+    parse_jse_date,
     parse_raw_candidates,
     parse_raw_candidates_with_quarantine,
     should_retry_after_scrape,
@@ -166,6 +169,170 @@ class FetchFilteringTests(unittest.TestCase):
         self.assertEqual(get_scrape_retry_delay_seconds(1, 1.5), 1.5)
         self.assertEqual(get_scrape_retry_delay_seconds(2, 1.5), 3.0)
         self.assertEqual(get_scrape_retry_delay_seconds(3, 1.5), 6.0)
+
+
+class ExtractCompanyFromContextTests(unittest.TestCase):
+    def test_returns_first_non_empty_line(self):
+        self.assertEqual(
+            extract_company_from_context("Absa Group Limited\n31 Mar 2026\nTrading Statement"),
+            "Absa Group Limited",
+        )
+
+    def test_skips_leading_blank_lines(self):
+        self.assertEqual(
+            extract_company_from_context("\n\nNaspers Limited\nSome detail"),
+            "Naspers Limited",
+        )
+
+    def test_single_line_with_no_newline(self):
+        self.assertEqual(
+            extract_company_from_context("Standard Bank Group Limited"),
+            "Standard Bank Group Limited",
+        )
+
+    def test_empty_string_returns_empty(self):
+        self.assertEqual(extract_company_from_context(""), "")
+
+    def test_whitespace_only_returns_empty(self):
+        self.assertEqual(extract_company_from_context("   \n  \n  "), "")
+
+    def test_strips_surrounding_whitespace(self):
+        self.assertEqual(
+            extract_company_from_context("  Investec Limited  \nother stuff"),
+            "Investec Limited",
+        )
+
+
+class ParseJseDateTests(unittest.TestCase):
+    def test_jse_day_mon_year_hhmm(self):
+        result = parse_jse_date("31 Mar 2026 09:15")
+        # JSE is UTC+2 (Africa/Johannesburg), so 09:15 SAST = 07:15 UTC
+        self.assertIn("07:15", result)
+        self.assertIn("2026-03-31", result)
+
+    def test_iso_date_hhmm(self):
+        result = parse_jse_date("2026-03-31 09:15")
+        self.assertIn("07:15", result)
+        self.assertIn("2026-03-31", result)
+
+    def test_iso_datetime(self):
+        result = parse_jse_date("2026-03-31T09:15:00")
+        self.assertIn("2026-03-31", result)
+        self.assertTrue(result.endswith("+00:00") or "07:15" in result)
+
+    def test_date_only_jse_format(self):
+        result = parse_jse_date("31 Mar 2026")
+        self.assertIn("2026-03-31", result)
+
+    def test_empty_string_returns_empty(self):
+        self.assertEqual(parse_jse_date(""), "")
+
+    def test_garbage_returns_empty(self):
+        self.assertEqual(parse_jse_date("not a date"), "")
+
+    def test_whitespace_returns_empty(self):
+        self.assertEqual(parse_jse_date("   "), "")
+
+
+class UnpackRawCandidateTests(unittest.TestCase):
+    def test_2_tuple(self):
+        href, title, ctx, company, date = _unpack_raw_candidate(
+            ("/documents/SENS_1.pdf", "Title")
+        )
+        self.assertEqual(href, "/documents/SENS_1.pdf")
+        self.assertEqual(title, "Title")
+        self.assertEqual(ctx, "")
+        self.assertEqual(company, "")
+        self.assertEqual(date, "")
+
+    def test_3_tuple(self):
+        href, title, ctx, company, date = _unpack_raw_candidate(
+            ("/documents/SENS_1.pdf", "Title", "Context blob")
+        )
+        self.assertEqual(ctx, "Context blob")
+        self.assertEqual(company, "")
+        self.assertEqual(date, "")
+
+    def test_5_tuple(self):
+        href, title, ctx, company, date = _unpack_raw_candidate(
+            ("/documents/SENS_1.pdf", "Title", "Context", "Absa Group", "31 Mar 2026 09:15")
+        )
+        self.assertEqual(company, "Absa Group")
+        self.assertEqual(date, "31 Mar 2026 09:15")
+
+    def test_1_tuple(self):
+        href, title, ctx, company, date = _unpack_raw_candidate(("/documents/SENS_1.pdf",))
+        self.assertEqual(href, "/documents/SENS_1.pdf")
+        self.assertEqual(title, "")
+
+    def test_empty_tuple(self):
+        href, title, ctx, company, date = _unpack_raw_candidate(())
+        self.assertEqual(href, "")
+        self.assertEqual(title, "")
+
+
+class ParseRawCandidatesMetadataTests(unittest.TestCase):
+    """Verify company and announcement_date are populated from the new tuple fields."""
+
+    _CONTEXT = "Absa Group Limited | Equity Issuer (JSE)"
+
+    def _make_5tuple(self, raw_company: str, raw_date: str) -> tuple:
+        return (
+            "/documents/SENS_999001.pdf",
+            "Absa Group Limited | Trading Statement",
+            self._CONTEXT,
+            raw_company,
+            raw_date,
+        )
+
+    def test_company_from_raw_company_field(self):
+        candidates = [self._make_5tuple("Absa Group Limited", "")]
+        announcements, _ = parse_raw_candidates(candidates)
+        self.assertEqual(len(announcements), 1)
+        self.assertEqual(announcements[0].company, "Absa Group Limited")
+
+    def test_company_falls_back_to_context_first_line(self):
+        # No raw_company; the context first line should be used.
+        candidates = [self._make_5tuple("", "")]
+        announcements, _ = parse_raw_candidates(candidates)
+        self.assertEqual(len(announcements), 1)
+        self.assertEqual(announcements[0].company, "Absa Group Limited | Equity Issuer (JSE)")
+
+    def test_announcement_date_from_raw_date(self):
+        candidates = [self._make_5tuple("Absa Group Limited", "31 Mar 2026 09:15")]
+        announcements, _ = parse_raw_candidates(candidates)
+        self.assertEqual(len(announcements), 1)
+        # Should contain the parsed UTC date, not just today's date.
+        self.assertIn("2026-03-31", announcements[0].announcement_date)
+        self.assertIn("07:15", announcements[0].announcement_date)
+
+    def test_announcement_date_falls_back_to_now_when_empty(self):
+        candidates = [self._make_5tuple("Absa Group Limited", "")]
+        announcements, _ = parse_raw_candidates(candidates)
+        self.assertEqual(len(announcements), 1)
+        # Should be a valid ISO datetime string containing today's year.
+        self.assertRegex(announcements[0].announcement_date, r"\d{4}-\d{2}-\d{2}T")
+
+    def test_announcement_date_falls_back_to_now_when_unparseable(self):
+        candidates = [self._make_5tuple("Absa Group Limited", "not-a-date")]
+        announcements, _ = parse_raw_candidates(candidates)
+        self.assertEqual(len(announcements), 1)
+        self.assertRegex(announcements[0].announcement_date, r"\d{4}-\d{2}-\d{2}T")
+
+    def test_3tuple_backward_compat_company_inferred_from_title(self):
+        # 3-tuple (old format): company should still fall back to infer_company(title).
+        candidates = [
+            (
+                "/documents/SENS_999002.pdf",
+                "FallbackCo | Trading Statement",
+                "FallbackCo | Equity Issuer (JSE)",
+            )
+        ]
+        announcements, _ = parse_raw_candidates(candidates)
+        self.assertEqual(len(announcements), 1)
+        # context first line is "FallbackCo | Equity Issuer (JSE)" — that's what
+        # extract_company_from_context returns (it takes the first non-empty line).
+        self.assertEqual(announcements[0].company, "FallbackCo | Equity Issuer (JSE)")
 
 
 if __name__ == "__main__":
