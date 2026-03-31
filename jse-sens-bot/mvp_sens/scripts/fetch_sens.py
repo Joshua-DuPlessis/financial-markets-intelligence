@@ -198,6 +198,68 @@ def infer_company(title: str) -> str:
     return title.strip()
 
 
+def extract_company_from_context(issuer_context: str) -> str:
+    """
+    Extract company name from the issuer context string.
+
+    The context is the innerText of the closest table row / container.
+    The company name typically appears as the first non-empty line or
+    before a known delimiter (newline, tab, date pattern).
+    """
+    if not issuer_context:
+        return ""
+    for line in issuer_context.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return issuer_context.strip()
+
+
+def parse_jse_date(raw_date: str) -> str:
+    """
+    Parse a JSE date string into an ISO 8601 UTC string.
+
+    Handles formats such as:
+      - '31 Mar 2026 09:15'
+      - '2026-03-31 09:15'
+      - '2026-03-31T09:15:00'
+
+    Date-only formats (no time component) are treated as UTC midnight for that
+    calendar date to avoid date-shifting when the time is unknown.
+
+    Returns an empty string on failure.
+    """
+    if not raw_date:
+        return ""
+    raw_date = raw_date.strip()
+    # Formats that include a time component — convert from SAST to UTC.
+    datetime_formats = [
+        "%d %b %Y %H:%M",
+        "%d %b %Y %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ]
+    for fmt in datetime_formats:
+        try:
+            dt = datetime.strptime(raw_date, fmt)
+            return dt.replace(tzinfo=ZoneInfo("Africa/Johannesburg")).astimezone(
+                timezone.utc
+            ).isoformat()
+        except ValueError:
+            continue
+    # Date-only formats — treat as UTC midnight to preserve the calendar date.
+    date_only_formats = ["%d %b %Y", "%Y-%m-%d"]
+    for fmt in date_only_formats:
+        try:
+            dt = datetime.strptime(raw_date, fmt)
+            return dt.replace(tzinfo=timezone.utc).isoformat()
+        except ValueError:
+            continue
+    return ""
+
+
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -232,18 +294,24 @@ def _new_reject_counts() -> dict[str, int]:
     }
 
 
-def _unpack_raw_candidate(raw_candidate: tuple[str, ...]) -> tuple[str, str, str]:
-    if len(raw_candidate) >= 3:
-        return str(raw_candidate[0]), str(raw_candidate[1]), str(raw_candidate[2])
-    if len(raw_candidate) == 2:
-        return str(raw_candidate[0]), str(raw_candidate[1]), ""
-    if len(raw_candidate) == 1:
-        return str(raw_candidate[0]), "", ""
-    return "", "", ""
+def _unpack_raw_candidate(
+    raw_candidate: tuple[str, ...],
+) -> tuple[str, str, str, str, str]:
+    """Unpack a raw candidate tuple of 1-5 elements.
+
+    Returns ``(href, title, context_text, raw_company, raw_date)``.
+    """
+    n = len(raw_candidate)
+    href = str(raw_candidate[0]) if n >= 1 else ""
+    title = str(raw_candidate[1]) if n >= 2 else ""
+    context_text = str(raw_candidate[2]) if n >= 3 else ""
+    raw_company = str(raw_candidate[3]) if n >= 4 else ""
+    raw_date = str(raw_candidate[4]) if n >= 5 else ""
+    return href, title, context_text, raw_company, raw_date
 
 
 def parse_raw_candidates(
-    raw_candidates: list[tuple[str, str] | tuple[str, str, str]],
+    raw_candidates: list[tuple[str, ...]],
     limit: int | None = None,
 ) -> tuple[list[Announcement], dict[str, int]]:
     announcements, reject_counts, _quarantine = parse_raw_candidates_with_quarantine(
@@ -254,7 +322,7 @@ def parse_raw_candidates(
 
 
 def parse_raw_candidates_with_quarantine(
-    raw_candidates: list[tuple[str, str] | tuple[str, str, str]],
+    raw_candidates: list[tuple[str, ...]],
     limit: int | None = None,
 ) -> tuple[list[Announcement], dict[str, int], list[dict[str, str]]]:
     """
@@ -268,7 +336,7 @@ def parse_raw_candidates_with_quarantine(
     quarantine_candidates: list[dict[str, str]] = []
 
     for candidate in raw_candidates:
-        raw_value, raw_title, raw_context = _unpack_raw_candidate(candidate)
+        raw_value, raw_title, raw_context, raw_company, raw_date = _unpack_raw_candidate(candidate)
         urls = extract_urls_from_text(raw_value)
         if not urls:
             urls = [raw_value]
@@ -319,12 +387,25 @@ def parse_raw_candidates_with_quarantine(
 
             seen_ids.add(sens_id)
             title = normalize_text(raw_title or sens_id)
+
+            # Determine company: prefer raw_company from DOM, then first line of
+            # issuer_context, then fall back to inferring from the title.
+            company: str
+            if raw_company:
+                company = normalize_text(raw_company)
+            else:
+                ctx_company = extract_company_from_context(normalize_text(raw_context))
+                company = ctx_company if ctx_company else infer_company(title)
+
+            # Determine announcement date: prefer raw_date from DOM, fall back to now.
+            announcement_date = parse_jse_date(raw_date) or now_utc_iso()
+
             announcements.append(
                 Announcement(
                     sens_id=sens_id,
-                    company=infer_company(title),
+                    company=company,
                     title=title,
-                    announcement_date=now_utc_iso(),
+                    announcement_date=announcement_date,
                     pdf_url=pdf_url,
                     issuer_context=normalize_text(raw_context),
                     issuer_tags=issuer_tags,
@@ -420,59 +501,85 @@ def _throttle_pdf_download() -> None:
         _last_download_monotonic = time.monotonic()
 
 
-async def _collect_raw_candidates(page) -> list[tuple[str, str, str]]:
+async def _collect_raw_candidates(page) -> list[tuple[str, str, str, str, str]]:
     """
     Collect raw candidates from page frames.
 
+    Each candidate is a 5-tuple:
+        (href, title, context_text, raw_company, raw_date)
+
+    ``raw_company`` and ``raw_date`` are extracted from the structured table row
+    columns when the anchor lives inside a ``<tr>`` (JSE SENS table layout: col 1
+    is the date, col 2 is the company name).  They default to empty strings when
+    the structured extraction fails or when the anchor is not inside a ``<tr>``.
+
     This is intentionally broad to tolerate upstream DOM changes.
     """
-    candidates: list[tuple[str, str, str]] = []
+    candidates: list[tuple[str, str, str, str, str]] = []
 
     for frame in page.frames:
         anchors = await frame.query_selector_all("a[href]")
         for anchor in anchors:
             href = (await anchor.get_attribute("href")) or ""
             title = normalize_text((await anchor.inner_text()) or "")
-            context_text = normalize_text(
-                await anchor.evaluate(
-                    """
-                    node => {
-                      const container = node.closest('tr,li,article,section,div');
-                      return container ? (container.innerText || "") : "";
-                    }
-                    """
-                )
+            row_data = await anchor.evaluate(
+                """
+                node => {
+                  const tr = node.closest('tr');
+                  const container = node.closest('tr,li,article,section,div');
+                  const contextText = container ? (container.innerText || "") : "";
+                  if (!tr) {
+                    return { contextText, rawDate: "", rawCompany: "" };
+                  }
+                  const cells = tr.querySelectorAll('td');
+                  const rawDate = cells.length >= 1 ? (cells[0].innerText || "").trim() : "";
+                  const rawCompany = cells.length >= 2 ? (cells[1].innerText || "").trim() : "";
+                  return { contextText, rawDate, rawCompany };
+                }
+                """
             )
+            context_text = normalize_text(row_data.get("contextText", ""))
+            raw_date = (row_data.get("rawDate") or "").strip()
+            raw_company = (row_data.get("rawCompany") or "").strip()
             if not href:
                 continue
             href_l = href.lower()
             if ".pdf" in href_l or "/documents/" in href_l:
-                candidates.append((href, title, context_text))
+                candidates.append((href, title, context_text, raw_company, raw_date))
 
         onclick_nodes = await frame.query_selector_all("[onclick]")
         for node in onclick_nodes:
             onclick_val = (await node.get_attribute("onclick")) or ""
             text = normalize_text((await node.inner_text()) or "")
-            context_text = normalize_text(
-                await node.evaluate(
-                    """
-                    node => {
-                      const container = node.closest('tr,li,article,section,div');
-                      return container ? (container.innerText || "") : "";
-                    }
-                    """
-                )
+            row_data = await node.evaluate(
+                """
+                node => {
+                  const tr = node.closest('tr');
+                  const container = node.closest('tr,li,article,section,div');
+                  const contextText = container ? (container.innerText || "") : "";
+                  if (!tr) {
+                    return { contextText, rawDate: "", rawCompany: "" };
+                  }
+                  const cells = tr.querySelectorAll('td');
+                  const rawDate = cells.length >= 1 ? (cells[0].innerText || "").trim() : "";
+                  const rawCompany = cells.length >= 2 ? (cells[1].innerText || "").trim() : "";
+                  return { contextText, rawDate, rawCompany };
+                }
+                """
             )
+            context_text = normalize_text(row_data.get("contextText", ""))
+            raw_date = (row_data.get("rawDate") or "").strip()
+            raw_company = (row_data.get("rawCompany") or "").strip()
             if not onclick_val:
                 continue
             onclick_l = onclick_val.lower()
             if ".pdf" in onclick_l or "/documents/" in onclick_l:
-                candidates.append((onclick_val, text, context_text))
+                candidates.append((onclick_val, text, context_text, raw_company, raw_date))
 
         # Fallback: inspect frame HTML in case links are embedded in script payloads.
         html = await frame.content()
         for embedded_url in extract_urls_from_text(html):
-            candidates.append((embedded_url, "", ""))
+            candidates.append((embedded_url, "", "", "", ""))
 
     return candidates
 
