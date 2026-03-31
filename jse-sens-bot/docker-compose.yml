@@ -45,6 +45,21 @@ services:
       - SENS_SKIP_WEEKENDS=1
     restart: unless-stopped
 
+  web-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jse-sens-bot:local
+    command: ["python", "-m", "mvp_sens.ui.app"]
+    volumes:
+      - ./mvp_sens/db:/app/mvp_sens/db
+    environment:
+      - SENS_UI_HOST=0.0.0.0
+      - SENS_UI_PORT=5000
+    expose:
+      - "5000"
+    restart: unless-stopped
+
   nginx:
     image: nginx:1.27-alpine
     ports:
@@ -52,6 +67,8 @@ services:
     volumes:
       - ./mvp_sens/docker/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./mvp_sens/data:/usr/share/nginx/html/data:ro
+    depends_on:
+      - web-ui
     restart: unless-stopped
 
 volumes:
